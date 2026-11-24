@@ -1,4 +1,4 @@
-import { itemMatchesBinding, type AutoDeliveryRule, type Context } from '@pkh/core';
+import { bindingKey, itemMatchesBinding, type AutoDeliveryRule, type Context } from '@pkh/core';
 import '@pkh/adapter';
 import '@pkh/plugin-retry-queue';
 
@@ -7,6 +7,29 @@ export const autoDeliveryPlugin = {
   inject: ['storage', 'blacklist', 'playerok'],
   apply(ctx: Context): void {
     const log = ctx.logger('automation.delivery');
+
+    /**
+     * Списывает выданный поштучный товар по стабильному ключу привязки, а не по индексу:
+     * между чтением списка правил и записью есть await (sendMessage), за который правила
+     * могли изменить из Telegram — по индексу списался бы товар из чужого правила.
+     * Возвращает остаток или null, если правило/товар уже не найдены.
+     */
+    const consumePiece = (index: number, key: string, good: string): number | null => {
+      let remaining: number | null = null;
+      ctx.storage.update<AutoDeliveryRule[]>('auto_deliveries', (list) => {
+        const target =
+          list[index] && bindingKey(list[index]) === key
+            ? list[index]
+            : list.find((entry) => bindingKey(entry) === key);
+        const goods = target?.goods;
+        if (!goods) return;
+        const idx = goods.indexOf(good);
+        if (idx === -1) return;
+        goods.splice(idx, 1);
+        remaining = goods.length;
+      });
+      return remaining;
+    };
 
     ctx.on('playerok/new-deal', async (event) => {
       try {
@@ -27,6 +50,7 @@ export const autoDeliveryPlugin = {
           for (let i = 0; i < deliveries.length; i++) {
             const rule = deliveries[i];
             if (!itemMatchesBinding(event.deal.item, rule)) continue;
+            const ruleKey = bindingKey(rule);
 
             if (rule.piece) {
               const goods = rule.goods ?? [];
@@ -45,28 +69,24 @@ export const autoDeliveryPlugin = {
 
               if (sent) {
                 anyDelivered = true;
-                let remaining = 0;
-                ctx.storage.update<AutoDeliveryRule[]>('auto_deliveries', (list) => {
-                  const target = list[i];
-                  if (target?.goods) {
-                    const idx = target.goods.indexOf(good);
-                    if (idx !== -1) target.goods.splice(idx, 1);
-                    remaining = target.goods.length;
-                  }
-                });
-                log.info(
-                  `Покупателю ${event.deal.user.username} выдан товар «${good}». Остаток: ${remaining}`,
-                );
+                const remaining = consumePiece(i, ruleKey, good);
+                if (remaining === null) {
+                  log.warn(
+                    `Товар «${good}» выдан, но не найден в правиле авто-выдачи — проверьте остатки вручную`,
+                  );
+                } else {
+                  log.info(
+                    `Покупателю ${event.deal.user.username} выдан товар «${good}». Остаток: ${remaining}`,
+                  );
+                }
               } else if (retryQueue) {
                 // Reserve the piece item immediately so it is never handed to another buyer while retry is pending
                 anyDelivered = true;
-                ctx.storage.update<AutoDeliveryRule[]>('auto_deliveries', (list) => {
-                  const target = list[i];
-                  if (target?.goods) {
-                    const idx = target.goods.indexOf(good);
-                    if (idx !== -1) target.goods.splice(idx, 1);
-                  }
-                });
+                if (consumePiece(i, ruleKey, good) === null) {
+                  log.warn(
+                    `Товар «${good}» зарезервирован под повтор, но не найден в правиле авто-выдачи`,
+                  );
+                }
                 await retryQueue.enqueue({
                   kind: 'send_message',
                   payload: { chatId: event.chat.id, text: good },

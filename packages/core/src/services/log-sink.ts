@@ -27,11 +27,28 @@ const RESET = '\x1b[0m';
  * Redacts Telegram bot tokens, session cookies, Bearer tokens, and inline passwords
  * so secrets are never written to console output or log files.
  */
+const SECRET_KEY = '(?:token|__ddg5_|session|password|cookies?|authorization)';
+
+// Quoted / JSON position: {"cookies":"token=abc; __ddg5_=xyz"}. The bare key=value rule
+// below cannot match it (the value starts with a quote), so cookies in object positions
+// used to reach the log file verbatim.
+const QUOTED_DOUBLE_RE = new RegExp(
+  `("?\\b${SECRET_KEY}"?\\s*[:=]\\s*)"(?:[^"\\\\\\n]|\\\\.)*"`,
+  'gi',
+);
+const QUOTED_SINGLE_RE = new RegExp(
+  `(\\b${SECRET_KEY}\\s*[:=]\\s*)'(?:[^'\\\\\\n]|\\\\.)*'`,
+  'gi',
+);
+const BARE_SECRET_RE = new RegExp(`(\\b${SECRET_KEY}\\s*[:=]\\s*)([^\\s;,"'}]+)`, 'gi');
+
 export function redactSecrets(input: string): string {
   return input
     .replace(/\b\d{7,12}:[A-Za-z0-9_-]{35}\b/g, '[REDACTED_TG_TOKEN]')
     .replace(/(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, '$1[REDACTED]')
-    .replace(/(\b(?:token|__ddg5_|session|password|cookie)\s*[:=]\s*)([^\s;,"'}]+)/gi, '$1[REDACTED]');
+    .replace(QUOTED_DOUBLE_RE, '$1"[REDACTED]"')
+    .replace(QUOTED_SINGLE_RE, "$1'[REDACTED]'")
+    .replace(BARE_SECRET_RE, '$1[REDACTED]');
 }
 
 function formatArgs(args: unknown[]): string {

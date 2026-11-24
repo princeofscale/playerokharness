@@ -1,5 +1,32 @@
 # PlayerOK Harness (`pkh`) — Статус проекта
 
+## Раунд 2026-11-25 — четырёхсторонний code review
+
+Независимое ревью четырьмя агентами (core / adapter / automation+retry / telegram+app),
+каждый правил только свою пакетную директорию. Найдено и исправлено:
+
+- **P0**: Zod 4 `.default()` не валидирует значение по умолчанию (`playerok: {}` в
+  `BotConfig`) → `.prefault()`; unhandled rejection из `setInterval(() => void this.tick())`
+  в трёх плагинах автоматизации и в maintenance-цикле адаптера → `safeInterval`;
+  гонка в `LockService` (два процесса могли взять один lock) → `O_EXCL`;
+  выход `removePlugin` / `resolvePath` за пределы рабочей директории → containment guard.
+- **P1**: обход изоляции untrusted-плагинов через `ctx.get('storage')`; доступ к store
+  `idempotency` (guard от двойной выдачи); утечка токена в `cfg:export`; потеря catch-up
+  окна при реконнекте WS; сломанный `reconfigureTransport()` после Setup Mode; повтор
+  неидемпотентного `createChatMessage`; двойное выполнение задач в retry-queue; неверный
+  ре-фетч товара в `auto-restore`; утечка `subscribedChatIds`; `answerCallbackQuery`.
+- **P2**: `safeInterval` стал single-flight; ограниченное хранение `cached_orders`,
+  `bumped_items` и idempotency-маркеров (30 дней вместо FIFO на 5000); неизвестный `kind`
+  в retry-queue больше не уходит в DLQ с первого прохода.
+
+Добавлены type-aware ESLint (`no-floating-promises`, `no-misused-promises`,
+`await-thenable`) для `packages/*/src`, `test/regressions.test.ts` (6 тестов на каждый
+исправленный класс дефектов) и `docs/ROADMAP.md` с планом развития.
+
+Проверка: `pnpm build` · `pnpm typecheck` · `pnpm lint` · `pnpm test` — **46/46**.
+
+---
+
 **Репозиторий:** https://github.com/princeofscale/playerokharness  
 **Стек:** TypeScript 5 · Cordis 4 · grammY · Zod · Vitest · ESLint · GitHub Actions
 

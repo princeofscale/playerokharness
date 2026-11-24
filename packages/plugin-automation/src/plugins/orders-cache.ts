@@ -84,6 +84,13 @@ export const ordersCachePlugin = {
         await ctx.storage.runExclusive('cached_orders', () => {
           ctx.storage.update<CachedOrders>('cached_orders', (orders) => {
             orders[entry.id] = entry;
+            // Bounded retention: without it the file and every getCachedOrders() parse
+            // grow for the whole lifetime of the shop.
+            const cutoff = Date.now() - 180 * 24 * 60 * 60 * 1000;
+            for (const [id, cached] of Object.entries(orders)) {
+              const ts = Date.parse(cached.date);
+              if (Number.isNaN(ts) || ts < cutoff) delete orders[id];
+            }
           });
         });
       } catch (err) {

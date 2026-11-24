@@ -30,19 +30,46 @@ export class LockService extends Service {
 
   private acquireFileLock(lockPath: string): number | null {
     fs.mkdirSync(path.dirname(lockPath), { recursive: true });
-    if (fs.existsSync(lockPath)) {
+
+    // O_EXCL create is the only atomic step here: checking existsSync() and then
+    // writing let two processes starting at the same instant both "acquire" the lock.
+    const tryCreate = (): boolean => {
       try {
-        const existingPid = Number(fs.readFileSync(lockPath, 'utf8').trim());
-        if (existingPid !== process.pid && isPidAlive(existingPid)) {
-          return existingPid;
-        }
-      } catch {
-        // stale or unreadable lock
+        fs.writeFileSync(lockPath, String(process.pid), { encoding: 'utf8', flag: 'wx' });
+        this.acquiredPaths.add(lockPath);
+        return true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') throw err;
+        return false;
       }
+    };
+
+    if (tryCreate()) return null;
+
+    let existingPid = 0;
+    try {
+      existingPid = Number(fs.readFileSync(lockPath, 'utf8').trim());
+    } catch {
+      // unreadable lock — treat as stale
     }
-    fs.writeFileSync(lockPath, String(process.pid), 'utf8');
-    this.acquiredPaths.add(lockPath);
-    return null;
+    if (existingPid !== process.pid && isPidAlive(existingPid)) {
+      return existingPid;
+    }
+
+    // Stale lock owned by a dead PID: drop it and race for the file once.
+    try {
+      fs.rmSync(lockPath, { force: true });
+    } catch {
+      // ignore
+    }
+    if (tryCreate()) return null;
+
+    try {
+      const winner = Number(fs.readFileSync(lockPath, 'utf8').trim());
+      return Number.isFinite(winner) && winner > 0 ? winner : process.pid;
+    } catch {
+      return process.pid;
+    }
   }
 
   public acquireInstanceLock(): number | null {

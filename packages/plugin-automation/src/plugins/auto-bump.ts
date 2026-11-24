@@ -6,6 +6,7 @@ import {
   itemMatchesAnyBinding,
   ItemStatuses,
   PriorityTypes,
+  safeInterval,
   Service,
   type BumpedItems,
   type ItemProfile,
@@ -40,13 +41,9 @@ export class AutoBumpService extends Service {
 
     if (config.enableTimer !== false) {
       const tickMs = config.tickIntervalMs ?? 3_000;
-      ctx.effect(() => {
-        const timer = setInterval(() => {
-          void this.tick();
-        }, tickMs);
-        timer.unref?.();
-        return () => clearInterval(timer);
-      }, 'autoBump:timer');
+      // safeInterval логирует и гасит reject из tick(): раньше сбой сети в getMyItems
+      // уходил в unhandledRejection и (Node >= 15) ронял весь процесс.
+      safeInterval(ctx, () => this.tick(), tickMs, 'autoBump:timer');
     }
   }
 

@@ -151,7 +151,7 @@ export const BotConfigSchema = z.object({
         withdrawal_requested: true,
       },
     }),
-  }).default({} as never),
+  }).prefault({}),
   telegram: z.object({
     api: z.object({
       token: z.string().default(''),

@@ -21,12 +21,27 @@ export interface AutoRestoreConfig {
   enableTimer?: boolean;
 }
 
+/**
+ * Отличает полный MyItem от ItemProfile из списка товаров.
+ *
+ * Проверка «'mayBePublished' in item» не работает: mapItem() в @pkh/adapter всегда
+ * проставляет mayBePublished (а также dataFields/category/attachments) даже профилю,
+ * поэтому ветка дозапроса товара была мёртвой и восстановление товаров, полученных
+ * из списков SOLD/EXPIRED, шло без dataFields и без категории. Полный товар содержит
+ * категорию и способ получения — их списковый ответ не отдаёт.
+ */
+function isCompleteItem(item: ItemProfile | MyItem): item is MyItem {
+  const candidate = item as Partial<MyItem>;
+  return Boolean(candidate.category?.id && candidate.obtainingType?.id);
+}
+
 export class AutoRestoreService extends Service {
   static provide = 'autoRestore';
   static inject = ['storage', 'playerok'];
 
   private readonly log;
   private readonly recreatedItems = new Set<string>();
+  private expiredRestoreInFlight = false;
 
   constructor(ctx: Context, config: AutoRestoreConfig = {}) {
     super(ctx, 'autoRestore');
@@ -49,6 +64,10 @@ export class AutoRestoreService extends Service {
         );
         if (target) {
           await this.restoreItem(target);
+        } else {
+          this.log.warn(
+            `Проданный товар «${event.deal.item.name}» не найден среди последних 24 SOLD — авто-восстановление пропущено`,
+          );
         }
       } catch (err) {
         this.log.error(
@@ -185,10 +204,12 @@ export class AutoRestoreService extends Service {
     if (!this.isRestoreMatched(itemOrProfile)) return false;
 
     try {
-      const item: MyItem =
-        'mayBePublished' in itemOrProfile
-          ? itemOrProfile
-          : await this.ctx.playerok.getItem({ id: itemOrProfile.id });
+      // Профиль из списка (SOLD/EXPIRED) не содержит dataFields/категории — дозапрашиваем
+      // полный товар, иначе замена данных падала с «нет полей для замены», а recreate
+      // не мог пересоздать товар («нет категории или способа получения»).
+      const item: MyItem = isCompleteItem(itemOrProfile)
+        ? itemOrProfile
+        : await this.ctx.playerok.getItem({ id: itemOrProfile.id });
 
       const isPremium = item.priority === PriorityTypes.PREMIUM;
       if (isPremium && !cfg.premium) return false;
@@ -306,6 +327,15 @@ export class AutoRestoreService extends Service {
   }
 
   public async restoreExpiredItems(): Promise<number> {
+    // Проход длиннее интервала таймера (45 с) при нескольких товарах: параллельные
+    // запуски (таймер + кнопка в Telegram) повторно публиковали один и тот же товар
+    // и могли дважды списать премиум/данные.
+    if (this.expiredRestoreInFlight) {
+      this.log.warn('Проверка истёкших товаров уже выполняется — параллельный запуск пропущен');
+      return 0;
+    }
+
+    this.expiredRestoreInFlight = true;
     let restored = 0;
     try {
       const expired = await this.ctx.playerok.getMyItems({ statuses: [ItemStatuses.EXPIRED] });
@@ -319,6 +349,8 @@ export class AutoRestoreService extends Service {
       }
     } catch (err) {
       this.log.error(`Ошибка при восстановлении истёкших товаров: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      this.expiredRestoreInFlight = false;
     }
     return restored;
   }

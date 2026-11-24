@@ -12,39 +12,65 @@ import {
   normalizeCustomApiUrl,
   StorageService,
   VERSION,
+  type BootMarker,
 } from '@pkh/core';
 import { createApplication, runDryRunSimulation } from './bootstrap.js';
 
 interface ParsedArgs {
   command: string;
   flags: Record<string, string | boolean>;
+  problems: string[];
 }
+
+/** Флаги, которым требуется значение. Всё, что не перечислено, считается опечаткой. */
+const VALUE_FLAGS = new Set(['data-dir', 'plugins-dir', 'from']);
+const BOOLEAN_FLAGS = new Set(['dry-run', 'simulate', 'no-telegram', 'help']);
 
 function parseArgs(argv: string[]): ParsedArgs {
   const args = argv.slice(2);
   let command = 'start';
+  let commandSeen = false;
   const flags: Record<string, string | boolean> = {};
+  const problems: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
-    if (!arg.startsWith('-') && i === 0) {
-      command = arg;
+    if (arg === '-h') {
+      flags.help = true;
       continue;
     }
-    if (arg === '-h' || arg === '--help') {
-      flags.help = true;
-    } else if (arg.startsWith('--')) {
-      const key = arg.slice(2);
-      const next = args[i + 1];
-      if (next && !next.startsWith('-')) {
-        flags[key] = next;
-        i += 1;
-      } else {
-        flags[key] = true;
+    if (!arg.startsWith('-')) {
+      // Команда — первый позиционный аргумент; флаги могут стоять до неё.
+      if (commandSeen) problems.push(`лишний аргумент «${arg}»`);
+      else {
+        command = arg;
+        commandSeen = true;
       }
+      continue;
     }
+    if (!arg.startsWith('--')) {
+      problems.push(`неизвестный флаг «${arg}»`);
+      continue;
+    }
+    const key = arg.slice(2);
+    if (BOOLEAN_FLAGS.has(key)) {
+      flags[key] = true;
+      continue;
+    }
+    if (!VALUE_FLAGS.has(key)) {
+      // Опечатка вроде --dryrun не должна молча запускать бота в реальном режиме
+      problems.push(`неизвестный флаг «${arg}»`);
+      continue;
+    }
+    const next = args[i + 1];
+    if (next === undefined || next.startsWith('-')) {
+      problems.push(`флаг «${arg}» требует значение`);
+      continue;
+    }
+    flags[key] = next;
+    i += 1;
   }
-  return { command, flags };
+  return { command, flags, problems };
 }
 
 function printHelp(): void {
@@ -147,7 +173,7 @@ async function runDoctor(dataDir: string): Promise<void> {
   await ctx.fiber.dispose();
 }
 
-async function runPluginsList(dataDir: string, pluginsDir?: string): Promise<void> {
+function runPluginsList(dataDir: string, pluginsDir?: string): void {
   const targetDir = path.resolve(pluginsDir ?? path.join(dataDir, 'plugins'));
   fs.mkdirSync(targetDir, { recursive: true });
   const entries = fs.readdirSync(targetDir, { withFileTypes: true });
@@ -170,7 +196,14 @@ async function runImportConfig(fromDir: string, dataDir: string): Promise<void> 
   }
 
   const folders = ['bot_settings', 'bot_data'];
+  // Копия текущих файлов: неудачный импорт (невалидный JSON/Zod) не должен уничтожать рабочий конфиг —
+  // StorageService при чтении битого файла перезаписывает .bak именно битым содержимым.
+  const backupRoot = path.join(
+    dataDir,
+    `import-backup-${new Date().toISOString().replace(/[:.]/g, '-')}`,
+  );
   let copied = 0;
+  let backedUp = 0;
 
   for (const folder of folders) {
     const srcFolder = path.join(srcRoot, folder);
@@ -180,7 +213,14 @@ async function runImportConfig(fromDir: string, dataDir: string): Promise<void> 
 
     for (const file of fs.readdirSync(srcFolder)) {
       if (!file.endsWith('.json')) continue;
-      fs.copyFileSync(path.join(srcFolder, file), path.join(dstFolder, file));
+      const dstPath = path.join(dstFolder, file);
+      if (fs.existsSync(dstPath)) {
+        const backupFolder = path.join(backupRoot, folder);
+        fs.mkdirSync(backupFolder, { recursive: true });
+        fs.copyFileSync(dstPath, path.join(backupFolder, file));
+        backedUp += 1;
+      }
+      fs.copyFileSync(path.join(srcFolder, file), dstPath);
       copied += 1;
     }
   }
@@ -192,13 +232,22 @@ async function runImportConfig(fromDir: string, dataDir: string): Promise<void> 
   ctx.storage.getBlacklist();
   await ctx.fiber.dispose();
 
-  console.log(`✅ Импорт завершён: скопировано и проверено JSON-файлов: ${copied} (${srcRoot} -> ${dataDir})`);
+  console.log(
+    `✅ Импорт завершён: скопировано и проверено JSON-файлов: ${copied} (${srcRoot} -> ${dataDir})` +
+      (backedUp > 0 ? `\n💾 Резервная копия прежних файлов: ${backupRoot}` : ''),
+  );
 }
 
 async function main(): Promise<void> {
-  const { command, flags } = parseArgs(process.argv);
+  const { command, flags, problems } = parseArgs(process.argv);
   if (flags.help) {
     printHelp();
+    return;
+  }
+  if (problems.length > 0) {
+    console.error(`Некорректные аргументы командной строки:\n  - ${problems.join('\n  - ')}`);
+    printHelp();
+    process.exitCode = 1;
     return;
   }
 
@@ -221,7 +270,7 @@ async function main(): Promise<void> {
     return;
   }
   if (command === 'plugins') {
-    await runPluginsList(dataDir, pluginsDir);
+    runPluginsList(dataDir, pluginsDir);
     return;
   }
   if (command === 'import-config') {
@@ -253,14 +302,32 @@ async function main(): Promise<void> {
     enableInstanceLock: !simulate,
   });
 
+  let shuttingDown = false;
   const shutdown = async (signal: string) => {
-    app.ctx.logger('pkh').info(`Получен сигнал ${signal}, завершаю работу...`);
-    await app.stop();
+    if (shuttingDown) return;
+    shuttingDown = true;
+    const log = app.ctx.logger('pkh');
+    log.info(`Получен сигнал ${signal}, завершаю работу...`);
+    try {
+      await app.stop();
+    } catch (err) {
+      log.error(`Ошибка при остановке: ${err instanceof Error ? err.message : String(err)}`);
+    }
     process.exit(0);
   };
 
   process.once('SIGINT', () => void shutdown('SIGINT'));
   process.once('SIGTERM', () => void shutdown('SIGTERM'));
+
+  // Команда /restart в Telegram: сервис ставит boot-marker и шлёт 'bot/shutdown'.
+  // Завершаем процесс, чтобы супервизор (systemd Restart=always / start_mac.command)
+  // поднял его снова, а отчёт о запуске отредактировал то же сообщение.
+  // Обычные остановки (SIGINT/SIGTERM, simulate) маркера 'restart' не имеют.
+  app.ctx.on('bot/shutdown', () => {
+    const marker = app.ctx.storage.get<BootMarker>('boot_marker');
+    if (marker?.action !== 'restart') return;
+    void shutdown('telegram /restart');
+  });
 
   await app.start();
 

@@ -12,7 +12,7 @@ export function formatTemplate(template: string, variables: Record<string, unkno
       if (current === null || current === undefined || typeof current !== 'object') {
         return fullMatch;
       }
-      if (!(part in current)) {
+      if (!Object.prototype.hasOwnProperty.call(current, part)) {
         return fullMatch;
       }
       current = (current as Record<string, unknown>)[part];

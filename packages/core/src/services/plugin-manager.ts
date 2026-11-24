@@ -46,7 +46,19 @@ interface ManagedPluginEntry {
 }
 
 const RESTRICTED_SERVICES = new Set(['autoWithdrawal', 'access', 'lock']);
-const RESTRICTED_STORAGE_KEYS = new Set(['owner_link', 'access_requests', 'config']);
+// 'idempotency' holds the double-delivery / double-complete guards: letting an
+// untrusted plugin rewrite it would defeat the money-safety net.
+const RESTRICTED_STORAGE_KEYS = new Set(['owner_link', 'access_requests', 'config', 'idempotency']);
+// Direct mutators bypass the per-key checks above, so they are blocked explicitly.
+const RESTRICTED_STORAGE_METHODS = new Set([
+  'markDealDelivered',
+  'markDealCompleted',
+  'rebindItem',
+  'getStorePath',
+]);
+
+const isClassComponent = (value: unknown): boolean =>
+  typeof value === 'function' && /^class\b/.test(Function.prototype.toString.call(value));
 
 function safePluginId(filename: string): string {
   const base = path.basename(filename).replace(/\.(mjs|js|zip)$/i, '');
@@ -69,7 +81,15 @@ function createRestrictedStorageProxy(pluginId: string, storage: StorageService)
       if (prop === 'getConfig') {
         return () => redactConfigForUntrusted(target.getConfig());
       }
-      if (prop === 'setConfig' || prop === 'updateConfig' || prop === 'exportSnapshot') {
+      if (
+        prop === 'setConfig' ||
+        prop === 'updateConfig' ||
+        prop === 'exportSnapshot' ||
+        // registerStore() would let a plugin re-register "config" (or any store) with a
+        // permissive schema / an escaping relativePath and then write it via set().
+        prop === 'registerStore' ||
+        (typeof prop === 'string' && RESTRICTED_STORAGE_METHODS.has(prop))
+      ) {
         return () => {
           throw new PluginPermissionError(pluginId, `storage.${String(prop)}`);
         };
@@ -97,11 +117,24 @@ function createRestrictedContext(
 
   return new Proxy(baseCtx, {
     get(target, prop, receiver) {
-      if (typeof prop === 'string' && RESTRICTED_SERVICES.has(prop)) {
-        throw new PluginPermissionError(pluginId, `ctx.${prop}`);
-      }
-      if (prop === 'storage') {
-        return storageProxy;
+      if (typeof prop === 'string') {
+        if (RESTRICTED_SERVICES.has(prop)) {
+          throw new PluginPermissionError(pluginId, `ctx.${prop}`);
+        }
+        if (prop === 'storage') {
+          return storageProxy;
+        }
+        if (prop === 'get') {
+          // ctx.get('storage') / ctx.get('access') used to return the real service,
+          // bypassing both the storage proxy and the restricted-service check.
+          return (name: string, strict?: boolean) => {
+            if (name === 'storage') return storageProxy;
+            if (RESTRICTED_SERVICES.has(name)) {
+              throw new PluginPermissionError(pluginId, `ctx.get("${name}")`);
+            }
+            return (target as unknown as { get(name: string, strict?: boolean): unknown }).get(name, strict);
+          };
+        }
       }
       const val = Reflect.get(target, prop, receiver);
       return typeof val === 'function' ? val.bind(target) : val;
@@ -214,11 +247,12 @@ export class PluginManagerService extends Service {
       const component: Component | null =
         mod.default ??
         (typeof mod.apply === 'function'
-          ? {
+          ? ({
               name: mod.meta?.name ?? mod.name ?? id,
               inject: mod.inject,
-              apply: mod.apply,
-            }
+              // cordis awaits the returned value; the static Component type declares void.
+              apply: (c: Context, cfg: unknown) => mod.apply!(c, cfg),
+            } as unknown as Component)
           : null);
 
       if (!component) {
@@ -446,12 +480,18 @@ export class PluginManagerService extends Service {
     this.entries.delete(id);
     this.setPersistedDisabled(id, false);
 
-    let removed = false;
-    for (const candidate of [
+    // `id` comes from settings/UI callbacks; never let it escape pluginsDir.
+    const candidates = [
       path.join(this.pluginsDir, `${id}.mjs`),
       path.join(this.pluginsDir, `${id}.js`),
       path.join(this.pluginsDir, id),
-    ]) {
+    ].map((candidate) => path.resolve(candidate));
+    const insidePluginsDir = (candidate: string): boolean =>
+      candidate === this.pluginsDir || candidate.startsWith(`${this.pluginsDir}${path.sep}`);
+
+    let removed = false;
+    for (const candidate of candidates) {
+      if (!insidePluginsDir(candidate)) continue;
       if (fs.existsSync(candidate)) {
         fs.rmSync(candidate, { recursive: true, force: true });
         removed = true;
@@ -469,6 +509,12 @@ export class PluginManagerService extends Service {
       inject: raw.inject,
       apply: (childCtx: Context, cfg: unknown) => {
         const restrictedCtx = createRestrictedContext(id, childCtx, rootStorage);
+        if (isClassComponent(component)) {
+          // Service subclasses cannot be invoked without the new operator; calling one
+          // threw a bare TypeError, so every untrusted class component was dead on arrival.
+          const Ctor = component as unknown as new (ctx: Context, cfg: unknown) => unknown;
+          return new Ctor(restrictedCtx, cfg);
+        }
         if (typeof component === 'function') {
           return (component as (ctx: Context, cfg: unknown) => unknown)(restrictedCtx, cfg);
         }

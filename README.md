@@ -187,11 +187,18 @@ export function apply(ctx) {
 ## 🧪 Проверка качества
 
 ```bash
-pnpm lint       # ESLint + typescript-eslint
+pnpm lint       # ESLint (для packages/*/src включён type-aware прогон:
+                # no-floating-promises / no-misused-promises)
 pnpm build      # Сборка всех 6 пакетов
 pnpm typecheck  # Строгая проверка типов (tsc --noEmit)
-pnpm test       # Vitest: unit + integration + local HTTP/WS server
+pnpm test       # Vitest: unit + integration + локальный HTTP/WS-сервер (46 тестов)
 ```
+
+> `pnpm test` исполняет собранный `dist/`, поэтому перед локальным прогоном нужен
+> `pnpm build` (CI делает это сам).
+
+Результаты архитектурного ревью, известные остаточные риски и план развития:
+[docs/ROADMAP.md](./docs/ROADMAP.md).
 
 ---
 

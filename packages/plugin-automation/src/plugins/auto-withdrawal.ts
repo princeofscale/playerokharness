@@ -1,6 +1,7 @@
 import {
   Context,
   isDue,
+  safeInterval,
   Service,
   TransactionProviderIds,
 } from '@pkh/core';
@@ -23,13 +24,9 @@ export class AutoWithdrawalService extends Service {
 
     if (config.enableTimer !== false) {
       const tickMs = config.tickIntervalMs ?? 10_000;
-      ctx.effect(() => {
-        const timer = setInterval(() => {
-          void this.tick();
-        }, tickMs);
-        timer.unref?.();
-        return () => clearInterval(timer);
-      }, 'autoWithdrawal:timer');
+      // safeInterval: updateConfig() в requestWithdrawal() вызывается до try и при ошибке
+      // записи файла ронял процесс через unhandledRejection.
+      safeInterval(ctx, () => this.tick(), tickMs, 'autoWithdrawal:timer');
     }
   }
 

@@ -11,6 +11,12 @@ if ! command -v node >/dev/null 2>&1; then
   exit 1
 fi
 
+NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
+if [ "${NODE_MAJOR}" -lt 20 ]; then
+  echo "Ошибка: требуется Node.js >= 20, установлен $(node -v) (https://nodejs.org)"
+  exit 1
+fi
+
 if ! command -v pnpm >/dev/null 2>&1; then
   echo "==> Устанавливаю pnpm через corepack..."
   corepack enable || npm install -g pnpm
@@ -30,7 +36,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=${APP_DIR}
-ExecStart=$(command -v node) ${APP_DIR}/packages/app/dist/cli.js start --data-dir ${APP_DIR}
+ExecStart="$(command -v node)" "${APP_DIR}/packages/app/dist/cli.js" start --data-dir "${APP_DIR}"
 Restart=always
 RestartSec=5
 Environment=NODE_ENV=production

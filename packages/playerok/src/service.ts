@@ -78,6 +78,7 @@ export class PlayerokService extends Service {
   private readonly log;
   private readonly customTransport: boolean;
   private unsubscribeFn: (() => void) | null = null;
+  private listeningPromise: Promise<void> | null = null;
   private readonly chatCache = new Map<string, Chat>();
 
   constructor(ctx: Context, config: PlayerokServiceConfig = {}) {
@@ -134,9 +135,23 @@ export class PlayerokService extends Service {
    */
   public async reconfigureTransport(): Promise<void> {
     if (this.isDryRun || this.customTransport) return;
+    // Wait for an in-flight subscription so `wasListening` reflects reality.
+    if (this.listeningPromise) await this.listeningPromise.catch(() => {});
+    const wasListening = Boolean(this.unsubscribeFn);
     await this.stopListening();
     await this.transport.close().catch(() => {});
     this.transport = this.buildLiveTransport();
+    if (wasListening) {
+      // The old listener chain (WS + timers) died with the old transport; without this the bot
+      // silently stops receiving messages and deals after cookies/proxy/UA are changed.
+      try {
+        await this.startListening();
+      } catch (err) {
+        this.log.error(
+          `Не удалось возобновить прослушивание событий PlayerOK: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
   }
 
   /**
@@ -244,12 +259,26 @@ export class PlayerokService extends Service {
 
   public async startListening(): Promise<void> {
     if (this.unsubscribeFn) return;
+    this.listeningPromise ??= this.beginListening().finally(() => {
+      this.listeningPromise = null;
+    });
+    await this.listeningPromise;
+  }
+
+  private async beginListening(): Promise<void> {
     if (!this.account) {
       await this.connect();
     }
-    this.unsubscribeFn = await this.transport.subscribe(async (event) => {
+    const transport = this.transport;
+    const unsubscribe = await transport.subscribe(async (event) => {
       await this.dispatchEvent(event);
     });
+    if (this.transport !== transport) {
+      // The transport was rebuilt while we were subscribing — never keep a stale listener.
+      unsubscribe();
+      return;
+    }
+    this.unsubscribeFn = unsubscribe;
     this.log.info('Слушатель событий PlayerOK запущен');
   }
 
@@ -319,7 +348,10 @@ export class PlayerokService extends Service {
     }
 
     const markChatAsRead = options.markChatAsRead ?? cfg.read_chat;
-    const attempts = options.maxAttempts ?? 3;
+    // createChatMessage is NOT idempotent: a timeout after the server accepted the
+    // message would re-send the goods key to the buyer. Retries are opt-in and belong
+    // to the persistent retry queue, which knows the deal/rule it is retrying.
+    const attempts = Math.max(1, options.maxAttempts ?? 1);
     let lastError: unknown;
 
     for (let i = 0; i < attempts; i++) {
@@ -332,6 +364,8 @@ export class PlayerokService extends Service {
         });
       } catch (err) {
         lastError = err;
+        // Permanent auth / anti-bot failures are not fixed by hammering the API again.
+        if (err instanceof UnauthorizedError || err instanceof BotCheckDetectedError) break;
       }
     }
 

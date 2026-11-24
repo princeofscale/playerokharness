@@ -68,6 +68,8 @@ export class RetryQueueService extends Service {
 
   private readonly log;
   private readonly handlers = new Map<string, RetryTaskHandler>();
+  /** Задачи, выполняющиеся прямо сейчас в этом процессе: защита от двойного запуска. */
+  private readonly inFlight = new Set<string>();
   private readonly baseDelayMs: number;
   private readonly maxDelayMs: number;
   private readonly defaultMaxAttempts: number;
@@ -232,27 +234,45 @@ export class RetryQueueService extends Service {
     let deadLettered = 0;
 
     for (const id of dueIds) {
-      const task = this.list('pending').find((t) => t.id === id);
-      if (!task) continue;
+      // Проходы могут перекрываться (5-секундный таймер + ручной запуск из Telegram),
+      // и без этой проверки одна и та же задача выполнялась дважды: повторный
+      // bump_item/publish_item списывал премиум заново, а send_message дублировал текст.
+      if (this.inFlight.has(id)) continue;
 
-      const handler = this.handlers.get(task.kind);
-      if (!handler) {
-        await this.markFailed(id, `Нет зарегистрированного обработчика для типа «${task.kind}»`, now, true);
-        deadLettered += 1;
-        continue;
-      }
-
+      this.inFlight.add(id);
       try {
-        await handler(task.payload, task);
-        await this.removeTask(id);
-        succeeded += 1;
-        this.log.info(`Повторная задача [${task.kind}] #${id} успешно выполнена`);
-        await this.ctx.parallel('retry/succeeded', task);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const becameDead = await this.markFailed(id, message, now, false);
-        if (becameDead) deadLettered += 1;
-        else rescheduled += 1;
+        const task = this.list('pending').find((t) => t.id === id);
+        if (!task) continue;
+
+        const handler = this.handlers.get(task.kind);
+        if (!handler) {
+          // A plugin registered later (or a not-yet-loaded one) may own this kind:
+          // treat it as a normal failed attempt so the task survives until maxAttempts.
+          const becameDead = await this.markFailed(
+            id,
+            `Нет зарегистрированного обработчика для типа «${task.kind}»`,
+            now,
+            false,
+          );
+          if (becameDead) deadLettered += 1;
+          else rescheduled += 1;
+          continue;
+        }
+
+        try {
+          await handler(task.payload, task);
+          await this.removeTask(id);
+          succeeded += 1;
+          this.log.info(`Повторная задача [${task.kind}] #${id} успешно выполнена`);
+          await this.ctx.parallel('retry/succeeded', task);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          const becameDead = await this.markFailed(id, message, now, false);
+          if (becameDead) deadLettered += 1;
+          else rescheduled += 1;
+        }
+      } finally {
+        this.inFlight.delete(id);
       }
     }
 

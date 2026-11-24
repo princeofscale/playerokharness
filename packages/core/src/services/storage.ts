@@ -145,6 +145,31 @@ export function readJsonSafe<T>(
   return fallback;
 }
 
+const IDEMPOTENCY_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const IDEMPOTENCY_MAX_ENTRIES = 5000;
+
+/**
+ * Keeps the double-delivery guards long enough to outlive any catch-up window
+ * (30 days), instead of dropping the oldest *inserted* marker by count — which
+ * could evict a recent deal and let a replayed NEW_DEAL deliver goods twice.
+ */
+export function pruneIdempotencyMarkers(map: Record<string, string>, now = Date.now()): void {
+  for (const [dealId, iso] of Object.entries(map)) {
+    const ts = Date.parse(iso);
+    if (Number.isNaN(ts) || now - ts > IDEMPOTENCY_TTL_MS) {
+      delete map[dealId];
+    }
+  }
+
+  const keys = Object.keys(map);
+  if (keys.length <= IDEMPOTENCY_MAX_ENTRIES) return;
+
+  keys.sort((a, b) => (Date.parse(map[a]) || 0) - (Date.parse(map[b]) || 0));
+  for (const dealId of keys.slice(0, keys.length - IDEMPOTENCY_MAX_ENTRIES)) {
+    delete map[dealId];
+  }
+}
+
 export const BINDING_STORE_NAMES = [
   'auto_deliveries',
   'data_replacement',
@@ -355,7 +380,12 @@ export class StorageService extends Service {
   }
 
   public resolvePath(relativePath: string): string {
-    return path.join(this.baseDir, relativePath);
+    const resolved = path.resolve(this.baseDir, relativePath);
+    const prefix = this.baseDir.endsWith(path.sep) ? this.baseDir : `${this.baseDir}${path.sep}`;
+    if (resolved !== this.baseDir && !resolved.startsWith(prefix)) {
+      throw new Error(`Путь «${relativePath}» выходит за пределы каталога данных`);
+    }
+    return resolved;
   }
 
   public getStorePath(name: string): string {
@@ -421,10 +451,7 @@ export class StorageService extends Service {
   public markDealDelivered(dealId: string): void {
     this.update<IdempotencyStore>('idempotency', (store) => {
       store.delivered_deals[dealId] = new Date().toISOString();
-      const keys = Object.keys(store.delivered_deals);
-      if (keys.length > 5000) {
-        delete store.delivered_deals[keys[0]];
-      }
+      pruneIdempotencyMarkers(store.delivered_deals);
     });
   }
 
@@ -436,10 +463,7 @@ export class StorageService extends Service {
   public markDealCompleted(dealId: string): void {
     this.update<IdempotencyStore>('idempotency', (store) => {
       store.completed_deals[dealId] = new Date().toISOString();
-      const keys = Object.keys(store.completed_deals);
-      if (keys.length > 5000) {
-        delete store.completed_deals[keys[0]];
-      }
+      pruneIdempotencyMarkers(store.completed_deals);
     });
   }
 

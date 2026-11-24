@@ -72,6 +72,11 @@ const CHALLENGE_SIGNATURES = [
 
 const MAX_CLAIMED_IDS = 3000;
 const CATCH_UP_MAX_AGE_MS = 10 * 60 * 1000;
+/**
+ * Last messages younger than this stay unclaimed on the initial chat fetch so that
+ * `pollNewDeals` can still emit NEW_DEAL/ITEM_PAID for a deal paid right before start-up.
+ */
+const RECENT_LAST_MESSAGE_MS = 90_000;
 
 function normalizeProxyUrl(proxy?: string): string | null {
   if (!proxy?.trim()) return null;
@@ -826,6 +831,20 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
     return true;
   }
 
+  /**
+   * Remembers a deal that already produced NEW_DEAL/ITEM_PAID events.
+   * Bounded like `claimedMessageIds` so a long-running bot does not grow this set forever.
+   */
+  private claimDealId(dealId: string): boolean {
+    if (!dealId || this.processedDealIds.has(dealId)) return false;
+    this.processedDealIds.add(dealId);
+    if (this.processedDealIds.size > MAX_CLAIMED_IDS) {
+      const oldest = this.processedDealIds.values().next().value;
+      if (oldest) this.processedDealIds.delete(oldest);
+    }
+    return true;
+  }
+
   private async mapMessageToEvents(message: ChatMessage, chat: Chat): Promise<PlayerokEvent[]> {
     const now = Date.now();
     if (!message.text) {
@@ -836,8 +855,7 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
     const token = message.text.trim();
     if (token === '{{ITEM_PAID}}' && message.deal?.id) {
       const deal = await this.getDeal(message.deal.id).catch(() => message.deal!);
-      if (this.processedDealIds.has(deal.id)) return [];
-      this.processedDealIds.add(deal.id);
+      if (!this.claimDealId(deal.id)) return [];
       if (!this.reviewCheckDeals.has(deal.id)) {
         this.reviewCheckDeals.set(deal.id, { lastCheck: 0, tries: 0 });
       }
@@ -892,52 +910,78 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
     const subId = `msg-${chatId}-${crypto.randomUUID().slice(0, 6)}`;
     this.subscribedChatIds.add(chatId);
     this.chatSubIds.set(subId, chatId);
-    this.ws.send(
-      JSON.stringify({
-        id: subId,
-        type: 'subscribe',
-        payload: {
-          operationName: 'chatMessageCreated',
-          query: GQL_QUERIES.chatMessageCreated,
-          variables: { filter: { chatId } },
-        },
-      }),
-    );
+    try {
+      this.ws.send(
+        JSON.stringify({
+          id: subId,
+          type: 'subscribe',
+          payload: {
+            operationName: 'chatMessageCreated',
+            query: GQL_QUERIES.chatMessageCreated,
+            variables: { filter: { chatId } },
+          },
+        }),
+      );
+    } catch {
+      // Roll back so the chat is not considered subscribed on a dead socket
+      // (otherwise it is never re-subscribed until the next reconnect).
+      this.subscribedChatIds.delete(chatId);
+      this.chatSubIds.delete(subId);
+    }
   }
 
   /**
    * Catches up messages that arrived during a WebSocket disconnect window (up to 10 minutes).
+   *
+   * @returns `false` when the chat list could not be fetched — the caller must then keep the
+   * disconnect window armed so the catch-up is retried on the next reconnect instead of being
+   * silently lost.
    */
-  public async catchUpMessages(sinceMs: number, handler: PlayerokEventHandler): Promise<void> {
+  public async catchUpMessages(sinceMs: number, handler: PlayerokEventHandler): Promise<boolean> {
     const cutoff = Math.max(sinceMs, Date.now() - CATCH_UP_MAX_AGE_MS);
+    let list: PaginatedList<Chat>;
     try {
-      const list = await this.getChats(15);
-      for (const chat of list.items) {
-        this.knownChats.set(chat.id, chat);
-        const messages = await this.getChatMessages(chat.id, 12);
-        const chronological = [...messages].sort(
-          (a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt),
-        );
-        for (const msg of chronological) {
-          const ts = Date.parse(msg.createdAt);
-          if (Number.isNaN(ts) || ts < cutoff) continue;
-          if (!this.claimMessageId(msg.id)) continue;
-          const events = await this.mapMessageToEvents(msg, chat);
-          for (const ev of events) {
+      list = await this.getChats(15);
+    } catch {
+      return false;
+    }
+    for (const chat of list.items) {
+      this.knownChats.set(chat.id, chat);
+      let messages: ChatMessage[];
+      try {
+        messages = await this.getChatMessages(chat.id, 12);
+      } catch {
+        continue;
+      }
+      const chronological = [...messages].sort(
+        (a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt),
+      );
+      for (const msg of chronological) {
+        const ts = Date.parse(msg.createdAt);
+        if (Number.isNaN(ts) || ts < cutoff) continue;
+        // Our own outgoing messages are not incoming events (deal placeholders excepted).
+        if (this.accountId && msg.user?.id === this.accountId && !(msg.text ?? '').startsWith('{{')) {
+          continue;
+        }
+        if (!this.claimMessageId(msg.id)) continue;
+        const events = await this.mapMessageToEvents(msg, chat);
+        for (const ev of events) {
+          try {
             await handler(ev);
+          } catch {
+            // a failing handler must not abort the rest of the catch-up
           }
         }
       }
-    } catch {
-      // keep catch-up non-fatal
     }
+    return true;
   }
 
   /**
    * Polls recently paid deals in case a buyer message overwrote `lastMessage` before WS subscribed.
    */
   public async pollNewDeals(handler: PlayerokEventHandler): Promise<void> {
-    const cutoff = Date.now() - 90_000;
+    const cutoff = Date.now() - RECENT_LAST_MESSAGE_MS;
     try {
       const list = await this.getChats(15);
       for (const chat of list.items) {
@@ -1005,10 +1049,14 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
     // Seed initial chats & emit CHAT_INITIALIZED
     try {
       const initial = await this.getChats(24);
+      const recentCutoff = Date.now() - RECENT_LAST_MESSAGE_MS;
       for (const chat of initial.items) {
         this.knownChats.set(chat.id, chat);
+        // Only pre-claim stale last messages: a recent one (a deal paid moments before start-up)
+        // must stay unclaimed so pollNewDeals can still emit NEW_DEAL/ITEM_PAID for it.
         if (chat.lastMessage?.id) {
-          this.claimMessageId(chat.lastMessage.id);
+          const lastTs = Date.parse(chat.lastMessage.createdAt);
+          if (!(lastTs >= recentCutoff)) this.claimMessageId(chat.lastMessage.id);
         }
         await handler({
           type: EventTypes.CHAT_INITIALIZED,
@@ -1047,6 +1095,8 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
         this.pingTimer.unref?.();
       });
 
+      // The whole handler body is wrapped in try/catch, so its promise never rejects.
+      // eslint-disable-next-line @typescript-eslint/no-misused-promises
       ws.on('message', async (raw) => {
         this.wsLastRecvAt = Date.now();
         try {
@@ -1056,6 +1106,17 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
             return;
           }
           if (msg.type === 'pong') return;
+
+          if (msg.type === 'error' || msg.type === 'complete') {
+            // A rejected/finished subscription used to stay in subscribedChatIds forever,
+            // so the chat was never re-subscribed and went permanently deaf.
+            const chatId = msg.id ? this.chatSubIds.get(msg.id) : undefined;
+            if (chatId && msg.id) {
+              this.chatSubIds.delete(msg.id);
+              this.subscribedChatIds.delete(chatId);
+            }
+            return;
+          }
 
           if (msg.type === 'connection_ack') {
             this.wsReconnectAttempts = 0;
@@ -1090,8 +1151,10 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
 
             if (this.wsLostAt !== null) {
               const lostAt = this.wsLostAt;
-              this.wsLostAt = null;
-              await this.catchUpMessages(lostAt, handler);
+              // Keep the window armed until the catch-up actually succeeded, otherwise a single
+              // failed listing right after reconnect would drop every missed message for good.
+              const caughtUp = await this.catchUpMessages(lostAt, handler);
+              if (caughtUp && this.wsLostAt === lostAt) this.wsLostAt = null;
             }
             return;
           }

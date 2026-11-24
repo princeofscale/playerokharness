@@ -1,3 +1,4 @@
+import https from 'node:https';
 import { Bot, Composer, InlineKeyboard, InputFile, type Context as GrammyContext } from 'grammy';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import {
@@ -75,6 +76,9 @@ import {
   type RenderedView,
 } from './keyboards.js';
 
+/** Ограничение на размер файла, скачиваемого из Telegram (защита от роста памяти). */
+const MAX_TELEGRAM_FILE_BYTES = 25 * 1024 * 1024;
+
 export interface TelegramServiceConfig {
   token?: string;
   customApiUrl?: string;
@@ -94,6 +98,7 @@ export class TelegramService extends Service {
   private readonly extraComposers = new Set<Composer<GrammyContext>>();
   private readonly floatMessageIds = new Map<number, number>(); // chatId -> last floating menu messageId
   private onSetupLaunch?: () => Promise<SetupProblem | null>;
+  private readonly proxyAgent: HttpsProxyAgent<string> | undefined;
   private running = false;
 
   constructor(ctx: Context, config: TelegramServiceConfig = {}) {
@@ -117,13 +122,17 @@ export class TelegramService extends Service {
       if (apiRoot) clientOpts.apiRoot = apiRoot;
       if (proxy?.trim()) {
         const proxyUrl = /^https?:\/\//i.test(proxy.trim()) ? proxy.trim() : `http://${proxy.trim()}`;
+        this.proxyAgent = new HttpsProxyAgent<string>(proxyUrl);
         clientOpts.baseFetchConfig = {
-          agent: new HttpsProxyAgent(proxyUrl),
+          agent: this.proxyAgent,
         };
+      } else {
+        this.proxyAgent = undefined;
       }
       this.bot = new Bot(token, Object.keys(clientOpts).length ? { client: clientOpts } : undefined);
       this.wireHandlers(this.bot);
     } else {
+      this.proxyAgent = undefined;
       this.bot = null;
       this.log.warn('Telegram token не указан — TelegramService запущен в неактивном режиме');
     }
@@ -150,7 +159,14 @@ export class TelegramService extends Service {
 
     ctx.effect(() => {
       return async () => {
-        await this.stop();
+        try {
+          await this.stop();
+        } catch (err) {
+          // Сбой остановки не должен ломать ctx.fiber.dispose() при завершении процесса
+          this.log.error(
+            `Ошибка остановки Telegram бота: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
       };
     }, 'telegram:lifecycle');
   }
@@ -170,7 +186,12 @@ export class TelegramService extends Service {
     if (!this.bot || this.running) return;
     this.running = true;
 
-    const me = await this.bot.api.getMe();
+    // Если инициализация не удалась (неверный токен, недоступный прокси), сервис не должен
+    // остаться в состоянии «запущен» — иначе повторный start() и stop() молча ничего не делают.
+    const me = await this.bot.api.getMe().catch((err: unknown) => {
+      this.running = false;
+      throw err;
+    });
     this.username = me.username ?? null;
 
     await this.bot.api
@@ -189,6 +210,7 @@ export class TelegramService extends Service {
     }
 
     void this.bot.start({ drop_pending_updates: true }).catch((err) => {
+      this.running = false;
       this.log.error(`Ошибка polling Telegram: ${err instanceof Error ? err.message : String(err)}`);
     });
   }
@@ -327,9 +349,44 @@ export class TelegramService extends Service {
       ? normalizeCustomApiUrl(tgApi.custom_api_url)
       : 'https://api.telegram.org';
     const url = `${base}/file/bot${this.bot.token}/${file.file_path}`;
+
+    // Глобальный fetch не принимает HttpsProxyAgent, поэтому при настроенном прокси
+    // скачиваем через node:https тем же агентом, что использует Bot API.
+    if (this.proxyAgent && url.startsWith('https:')) {
+      return await this.downloadViaProxy(url, this.proxyAgent);
+    }
+
     const resp = await fetch(url);
     if (!resp.ok) throw new Error(`Не удалось скачать файл из Telegram: HTTP ${resp.status}`);
     return Buffer.from(await resp.arrayBuffer());
+  }
+
+  private downloadViaProxy(url: string, agent: HttpsProxyAgent<string>): Promise<Buffer> {
+    return new Promise<Buffer>((resolve, reject) => {
+      const req = https.request(url, { method: 'GET', agent }, (res) => {
+        const status = res.statusCode ?? 0;
+        if (status < 200 || status >= 300) {
+          res.resume();
+          reject(new Error(`Не удалось скачать файл из Telegram: HTTP ${status}`));
+          return;
+        }
+        const chunks: Buffer[] = [];
+        let total = 0;
+        res.on('data', (chunk: Buffer) => {
+          total += chunk.length;
+          if (total > MAX_TELEGRAM_FILE_BYTES) {
+            req.destroy(new Error('Файл из Telegram слишком большой'));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        res.on('end', () => resolve(Buffer.concat(chunks)));
+        res.on('error', reject);
+      });
+      req.setTimeout(30_000, () => req.destroy(new Error('Таймаут скачивания файла из Telegram')));
+      req.on('error', reject);
+      req.end();
+    });
   }
 
   private wireHandlers(bot: Bot): void {
@@ -1048,7 +1105,9 @@ export class TelegramService extends Service {
 
     if (section === 'cfg' && arg1 === 'export') {
       await gctx.answerCallbackQuery();
-      const snapshot = JSON.stringify(storage.exportSnapshot(), null, 2);
+      // exportSnapshot() includes the "config" store verbatim: sending it unredacted
+      // would paste the Telegram token and the PlayerOK cookies into a chat history.
+      const snapshot = JSON.stringify(redactSnapshotSecrets(storage.exportSnapshot()), null, 2);
       const file = new InputFile(Buffer.from(snapshot, 'utf8'), `pkh-config-${Date.now()}.json`);
       await gctx.replyWithDocument(file, { caption: '🗂 Экспорт настроек и данных PlayerOK Harness (pkh)' });
       return;
@@ -1552,4 +1611,22 @@ declare module 'cordis' {
   interface Context {
     telegram: TelegramService;
   }
+}
+
+/**
+ * Strips secrets out of an exported settings snapshot. `exportSnapshot()` deliberately
+ * returns the raw stores, including `config` with the Telegram token and PlayerOK cookies.
+ */
+export function redactSnapshotSecrets(snapshot: Record<string, unknown>): Record<string, unknown> {
+  const copy = structuredClone(snapshot);
+  const config = copy.config as
+    | {
+        telegram?: { api?: { token?: string }; bot?: { password?: string } };
+        playerok?: { api?: { cookies?: string } };
+      }
+    | undefined;
+  if (config?.telegram?.api) config.telegram.api.token = '';
+  if (config?.telegram?.bot) config.telegram.bot.password = '';
+  if (config?.playerok?.api) config.playerok.api.cookies = '';
+  return copy;
 }
