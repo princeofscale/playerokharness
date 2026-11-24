@@ -24,6 +24,7 @@ import {
 } from '@pkh/core';
 import '@pkh/adapter';
 import '@pkh/plugin-automation';
+import '@pkh/plugin-retry-queue';
 import type { StatsPeriod } from '@pkh/plugin-automation';
 import {
   InputStateStore,
@@ -60,6 +61,7 @@ import {
   renderOtherSettings,
   renderProfile,
   renderRestoreSettings,
+  renderRetryQueue,
   renderReviewsList,
   renderSetupMode,
   renderSignedUsers,
@@ -388,12 +390,14 @@ export class TelegramService extends Service {
       const acc = this.ctx.playerok?.account;
       const plugins = this.ctx.plugins.list();
       const activePlugins = plugins.filter((p) => p.enabled).length;
+      const rqStats = this.ctx.get('retryQueue', false)?.getStats();
       const text = [
         '<b>📊 Статус PlayerOK Harness</b>',
         '',
         `Аккаунт: <b>${escapeHtml(acc?.username ?? 'не подключен')}</b>`,
         `Режим: <b>${this.ctx.playerok?.setupProblem ? 'SETUP MODE' : this.ctx.playerok?.isDryRun ? 'DRY-RUN' : 'LIVE'}</b>`,
         `Плагинов активно: <b>${activePlugins}/${plugins.length}</b>`,
+        ...(rqStats ? [`Очередь повторов: <b>${rqStats.pending}</b> pending / <b>${rqStats.dead}</b> DLQ`] : []),
         `Uptime: <b>${Math.floor(process.uptime())}с</b>`,
       ].join('\n');
       await gctx.reply(text, { parse_mode: 'HTML' });
@@ -651,6 +655,8 @@ export class TelegramService extends Service {
           return this.showView(gctx, renderModulesList(this.ctx.plugins.list()));
         case 'logs':
           return this.showView(gctx, renderLogs(this.ctx.logSink?.getRecentLines(40) ?? []));
+        case 'retry_queue':
+          return this.showView(gctx, renderRetryQueue(this.ctx.get('retryQueue', false)?.list() ?? []));
         case 'signed_users':
           return this.showView(gctx, renderSignedUsers(this.ctx.access.getSignedUsers()));
         case 'configs':
@@ -664,6 +670,58 @@ export class TelegramService extends Service {
               Boolean(this.ctx.updater?.hasNewerRelease()),
             ),
           );
+      }
+      return;
+    }
+
+    if (section === 'rq') {
+      const rq = this.ctx.get('retryQueue', false);
+      if (!rq) {
+        await gctx.answerCallbackQuery({ text: 'Сервис очереди повторов не загружен', show_alert: true });
+        return;
+      }
+      if (arg1 === 'run') {
+        const res = await rq.processDue();
+        await gctx.answerCallbackQuery({
+          text: `Выполнено: ${res.succeeded}, отложено: ${res.rescheduled}, DLQ: ${res.deadLettered}`,
+          show_alert: true,
+        });
+        return this.showView(gctx, renderRetryQueue(rq.list()));
+      }
+      if (arg1 === 'retry_dead') {
+        const moved = await rq.retryAllDead();
+        const res = moved > 0 ? await rq.processDue() : { succeeded: 0, rescheduled: 0, deadLettered: 0 };
+        await gctx.answerCallbackQuery({
+          text:
+            moved > 0
+              ? `Возвращено из DLQ: ${moved} (выполнено: ${res.succeeded})`
+              : 'Dead-Letter Queue пуста',
+          show_alert: true,
+        });
+        return this.showView(gctx, renderRetryQueue(rq.list()));
+      }
+      if (arg1 === 'clear_dead') {
+        const cleared = await rq.clearDead();
+        await gctx.answerCallbackQuery({ text: `Удалено из DLQ: ${cleared}` });
+        return this.showView(gctx, renderRetryQueue(rq.list()));
+      }
+      if (arg1 === 'retry' && arg2) {
+        const ok = await rq.retryDeadTask(arg2);
+        if (ok) {
+          const res = await rq.processDue();
+          await gctx.answerCallbackQuery({
+            text: res.succeeded > 0 ? `Задача #${arg2} выполнена` : `Задача #${arg2} возвращена в очередь`,
+            show_alert: true,
+          });
+        } else {
+          await gctx.answerCallbackQuery({ text: 'Задача не найдена', show_alert: true });
+        }
+        return this.showView(gctx, renderRetryQueue(rq.list()));
+      }
+      if (arg1 === 'del' && arg2) {
+        const removed = await rq.removeTask(arg2);
+        await gctx.answerCallbackQuery({ text: removed ? `Задача #${arg2} удалена` : 'Задача не найдена' });
+        return this.showView(gctx, renderRetryQueue(rq.list()));
       }
       return;
     }

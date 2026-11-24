@@ -20,6 +20,7 @@ import {
   type PlayerokTransport,
 } from '@pkh/adapter';
 import { automationBundle } from '@pkh/plugin-automation';
+import { RetryQueueService } from '@pkh/plugin-retry-queue';
 import { TelegramService } from '@pkh/plugin-telegram';
 
 export interface AppOptions {
@@ -68,6 +69,10 @@ export async function createApplication(options: AppOptions = {}): Promise<Playe
     transport: options.transport,
     mockSeed: options.mockSeed,
     enableMaintenanceLoops: options.enableTimers ?? true,
+  });
+
+  await ctx.use(RetryQueueService, {
+    enableTimer: options.enableTimers ?? true,
   });
 
   await ctx.use(automationBundle, {

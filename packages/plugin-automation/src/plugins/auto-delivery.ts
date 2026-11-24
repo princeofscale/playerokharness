@@ -1,5 +1,6 @@
 import { itemMatchesBinding, type AutoDeliveryRule, type Context } from '@pkh/core';
 import '@pkh/adapter';
+import '@pkh/plugin-retry-queue';
 
 export const autoDeliveryPlugin = {
   name: 'automation:auto-delivery',
@@ -20,6 +21,7 @@ export const autoDeliveryPlugin = {
           }
 
           const deliveries = ctx.storage.getAutoDeliveries();
+          const retryQueue = ctx.get('retryQueue', false);
           let anyDelivered = false;
 
           for (let i = 0; i < deliveries.length; i++) {
@@ -33,7 +35,14 @@ export const autoDeliveryPlugin = {
                 continue;
               }
               const good = goods[0];
-              const sent = await ctx.playerok.sendMessage(event.chat.id, good);
+              let sent = null;
+              let sendError: string | undefined;
+              try {
+                sent = await ctx.playerok.sendMessage(event.chat.id, good);
+              } catch (err) {
+                sendError = err instanceof Error ? err.message : String(err);
+              }
+
               if (sent) {
                 anyDelivered = true;
                 let remaining = 0;
@@ -48,14 +57,46 @@ export const autoDeliveryPlugin = {
                 log.info(
                   `Покупателю ${event.deal.user.username} выдан товар «${good}». Остаток: ${remaining}`,
                 );
+              } else if (retryQueue) {
+                // Reserve the piece item immediately so it is never handed to another buyer while retry is pending
+                anyDelivered = true;
+                ctx.storage.update<AutoDeliveryRule[]>('auto_deliveries', (list) => {
+                  const target = list[i];
+                  if (target?.goods) {
+                    const idx = target.goods.indexOf(good);
+                    if (idx !== -1) target.goods.splice(idx, 1);
+                  }
+                });
+                await retryQueue.enqueue({
+                  kind: 'send_message',
+                  payload: { chatId: event.chat.id, text: good },
+                  dedupeKey: `delivery:${event.deal.id}:${i}`,
+                  error: sendError ?? 'sendMessage failed during auto-delivery',
+                });
               }
             } else {
               const lines = rule.message ?? [];
               if (lines.length === 0) continue;
-              const sent = await ctx.playerok.sendMessage(event.chat.id, lines.join('\n'));
+              const text = lines.join('\n');
+              let sent = null;
+              let sendError: string | undefined;
+              try {
+                sent = await ctx.playerok.sendMessage(event.chat.id, text);
+              } catch (err) {
+                sendError = err instanceof Error ? err.message : String(err);
+              }
+
               if (sent) {
                 anyDelivered = true;
                 log.info(`Покупателю ${event.deal.user.username} отправлено сообщение авто-выдачи`);
+              } else if (retryQueue) {
+                anyDelivered = true;
+                await retryQueue.enqueue({
+                  kind: 'send_message',
+                  payload: { chatId: event.chat.id, text },
+                  dedupeKey: `delivery:${event.deal.id}:${i}`,
+                  error: sendError ?? 'sendMessage failed during auto-delivery',
+                });
               }
             }
           }

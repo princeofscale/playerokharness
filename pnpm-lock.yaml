@@ -218,6 +218,9 @@ importers:
       '@pkh/plugin-automation':
         specifier: workspace:*
         version: link:../plugin-automation
+      '@pkh/plugin-retry-queue':
+        specifier: workspace:*
+        version: link:../plugin-retry-queue
       '@pkh/plugin-telegram':
         specifier: workspace:*
         version: link:../plugin-telegram
@@ -264,9 +267,27 @@ importers:
       '@pkh/core':
         specifier: workspace:*
         version: link:../core
+      '@pkh/plugin-retry-queue':
+        specifier: workspace:*
+        version: link:../plugin-retry-queue
       cordis:
         specifier: 4.0.0-rc.13
         version: 4.0.0-rc.13
+
+  packages/plugin-retry-queue:
+    dependencies:
+      '@pkh/adapter':
+        specifier: workspace:*
+        version: link:../playerok
+      '@pkh/core':
+        specifier: workspace:*
+        version: link:../core
+      cordis:
+        specifier: 4.0.0-rc.13
+        version: 4.0.0-rc.13
+      zod:
+        specifier: ^4.0.0
+        version: 4.6.7
 
   packages/plugin-telegram:
     dependencies:
@@ -279,6 +300,9 @@ importers:
       '@pkh/plugin-automation':
         specifier: workspace:*
         version: link:../plugin-automation
+      '@pkh/plugin-retry-queue':
+        specifier: workspace:*
+        version: link:../plugin-retry-queue
       cordis:
         specifier: 4.0.0-rc.13
         version: 4.0.0-rc.13

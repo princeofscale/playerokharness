@@ -9,6 +9,7 @@
   "references": [
     { "path": "../core" },
     { "path": "../playerok" },
-    { "path": "../plugin-automation" }
+    { "path": "../plugin-automation" },
+    { "path": "../plugin-retry-queue" }
   ]
 }

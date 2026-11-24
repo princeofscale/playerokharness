@@ -5,6 +5,7 @@ import {
   type DealEvent,
 } from '@pkh/core';
 import '@pkh/adapter';
+import '@pkh/plugin-retry-queue';
 
 export function buildTemplateVars(ctx: Context, event: Pick<DealEvent, 'deal' | 'chat'>): Record<string, unknown> {
   const buyer = event.deal.user ?? ctx.playerok.getChatOtherUser(event.chat);
@@ -38,9 +39,17 @@ export const blacklistPlugin = {
             await ctx.playerok.updateDeal(event.deal.id, ItemDealStatuses.ROLLED_BACK);
             refunded = true;
           } catch (err) {
-            log.error(
-              `Не удалось вернуть сделку ${event.deal.id} покупателя из ЧС: ${err instanceof Error ? err.message : String(err)}`,
-            );
+            const msg = err instanceof Error ? err.message : String(err);
+            log.error(`Не удалось вернуть сделку ${event.deal.id} покупателя из ЧС: ${msg}`);
+            const retryQueue = ctx.get('retryQueue', false);
+            if (retryQueue) {
+              await retryQueue.enqueue({
+                kind: 'update_deal',
+                payload: { dealId: event.deal.id, status: ItemDealStatuses.ROLLED_BACK },
+                dedupeKey: `blacklist-refund:${event.deal.id}`,
+                error: msg,
+              });
+            }
           }
 
           if (refunded) {

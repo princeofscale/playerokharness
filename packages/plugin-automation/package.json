@@ -17,6 +17,7 @@
   "dependencies": {
     "@pkh/core": "workspace:*",
     "@pkh/adapter": "workspace:*",
+    "@pkh/plugin-retry-queue": "workspace:*",
     "cordis": "4.0.0-rc.13"
   }
 }

@@ -12,6 +12,7 @@ import {
   type MyItem,
 } from '@pkh/core';
 import '@pkh/adapter';
+import '@pkh/plugin-retry-queue';
 
 export interface TrackedPosition {
   name: string;
@@ -88,7 +89,21 @@ export class AutoBumpService extends Service {
       const prem = statuses.find((s) => s.type === PriorityTypes.PREMIUM || s.price > 0);
       if (!prem) throw new Error('PREMIUM статус не найден');
 
-      await this.ctx.playerok.increaseItemPriorityStatus(item.id, prem.id);
+      try {
+        await this.ctx.playerok.increaseItemPriorityStatus(item.id, prem.id);
+      } catch (bumpErr) {
+        const msg = bumpErr instanceof Error ? bumpErr.message : String(bumpErr);
+        const retryQueue = this.ctx.get('retryQueue', false);
+        if (retryQueue) {
+          await retryQueue.enqueue({
+            kind: 'bump_item',
+            payload: { itemId: item.id, priorityStatusId: prem.id },
+            dedupeKey: `bump:${item.id}`,
+            error: msg,
+          });
+        }
+        throw bumpErr;
+      }
 
       this.ctx.storage.update<BumpedItems>('bumped_items', (map) => {
         map[item.id] = new Date().toISOString();

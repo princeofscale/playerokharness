@@ -8,6 +8,7 @@
   "include": ["src/**/*.ts"],
   "references": [
     { "path": "../core" },
-    { "path": "../playerok" }
+    { "path": "../playerok" },
+    { "path": "../plugin-retry-queue" }
   ]
 }

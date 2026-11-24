@@ -32,6 +32,7 @@ import {
   type VerifiedCard,
 } from '@pkh/core';
 import { computeOrdersStats, type StatsPeriod, type TrackedPosition } from '@pkh/plugin-automation';
+import type { RetryTask } from '@pkh/plugin-retry-queue';
 import type { BindingBucket, BindingStoreKey } from './fsm.js';
 
 export interface RenderedView {
@@ -134,8 +135,8 @@ export function renderMainMenu(dryRun = false, setupProblem: SetupProblem | null
     .text('🌟 Отзывы', 'reviews:0:0').row()
     .text('━━━ СИСТЕМА ━━━', 'noop').row()
     .text('🔌 Плагины', 'menu:modules').text('🗒️ Логи', 'menu:logs').row()
-    .text('🔃 Обновления', 'menu:updates').text('🔑 Авторизации', 'menu:signed_users').row()
-    .text('🗂 Конфиги', 'menu:configs');
+    .text('🔁 Очередь повторов', 'menu:retry_queue').text('🔃 Обновления', 'menu:updates').row()
+    .text('🔑 Авторизации', 'menu:signed_users').text('🗂 Конфиги', 'menu:configs');
   return { text, keyboard: kb };
 }
 
@@ -857,4 +858,52 @@ export function renderConfigsMenu(baseDir: string): RenderedView {
       .text('📤 Выгрузить снимок конфига', 'cfg:export').row()
       .text('⬅️ В меню', 'menu:main'),
   };
+}
+
+export function renderRetryQueue(tasks: RetryTask[]): RenderedView {
+  const pending = tasks.filter((t) => t.status === 'pending');
+  const dead = tasks.filter((t) => t.status === 'dead');
+
+  const lines: string[] = [
+    '<b>🔁 Очередь повторов и Dead-Letter Queue</b>',
+    '',
+    `В ожидании (pending): <b>${pending.length}</b> | Dead-Letter (DLQ): <b>${dead.length}</b>`,
+  ];
+
+  if (tasks.length === 0) {
+    lines.push('', '<i>Очередь пуста — сбоев API нет.</i>');
+  } else {
+    lines.push('');
+    for (const task of tasks.slice(0, 10)) {
+      const icon = task.status === 'dead' ? '☠️' : '⏳';
+      const errPreview = task.lastError ? ` — ${escapeHtml(task.lastError.slice(0, 70))}` : '';
+      lines.push(
+        `${icon} <code>${escapeHtml(task.id)}</code> · <b>${escapeHtml(task.kind)}</b> (${task.attempts}/${task.maxAttempts})${errPreview}`,
+      );
+    }
+    if (tasks.length > 10) {
+      lines.push(`<i>…и ещё ${tasks.length - 10} задач(и)</i>`);
+    }
+  }
+
+  const kb = new InlineKeyboard()
+    .text('▶️ Обработать сейчас', 'rq:run')
+    .text('🔄 Обновить', 'menu:retry_queue').row();
+
+  if (dead.length > 0) {
+    kb.text(`♻️ Повторить все DLQ (${dead.length})`, 'rq:retry_dead')
+      .text('🧹 Очистить DLQ', 'rq:clear_dead').row();
+  }
+
+  for (const task of tasks.slice(0, 6)) {
+    if (task.status === 'dead') {
+      kb.text(`♻️ ${task.id}`, `rq:retry:${task.id}`)
+        .text(`🗑 ${task.id}`, `rq:del:${task.id}`).row();
+    } else {
+      kb.text(`🗑 Удалить ${task.id}`, `rq:del:${task.id}`).row();
+    }
+  }
+
+  kb.text('⬅️ В меню', 'menu:main');
+  return { text: lines.join('\n'), keyboard: kb };
 }

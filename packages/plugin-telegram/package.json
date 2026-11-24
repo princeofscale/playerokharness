@@ -18,6 +18,7 @@
     "@pkh/core": "workspace:*",
     "@pkh/adapter": "workspace:*",
     "@pkh/plugin-automation": "workspace:*",
+    "@pkh/plugin-retry-queue": "workspace:*",
     "cordis": "4.0.0-rc.13",
     "grammy": "^1.36.0",
     "https-proxy-agent": "^9.1.0"

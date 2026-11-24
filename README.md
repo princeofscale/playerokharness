@@ -61,6 +61,7 @@ flowchart LR
   Adapter --> GQL["GraphQLPlayerokTransport<br/>HTTP APQ + Multipart + WS + Catch-up"]
 
   Core --> Auto["@pkh/plugin-automation<br/>9 Cordis-плагинов бизнес-логики"]
+  Core --> Retry["@pkh/plugin-retry-queue<br/>Persistent Retry + Backoff + DLQ"]
   Core --> TG["@pkh/plugin-telegram<br/>TelegramService (grammY)"]
   Core --> Ext["plugins/*.mjs<br/>Внешние пользовательские плагины"]
 ```
@@ -69,8 +70,9 @@ flowchart LR
 |---|---|
 | [`@pkh/core`](./packages/core) | Ядро Cordis 4, типы/энамы, типизированная шина событий, атомарное хранилище с мьютексом и идемпотентностью, маскирование секретов в логах, менеджер плагинов |
 | [`@pkh/adapter`](./packages/playerok) | `PlayerokService`, `MockPlayerokTransport` и `GraphQLPlayerokTransport` (HTTP APQ, multipart upload, `graphql-transport-ws`, catch-up, review polling, proxy) |
-| [`@pkh/plugin-automation`](./packages/plugin-automation) | 9 независимых плагинов автоматизации с `try/catch`-изоляцией и идемпотентностью |
-| [`@pkh/plugin-telegram`](./packages/plugin-telegram) | Полноценный Telegram-интерфейс на `grammY` с пагинацией, фильтрами, FSM, Setup Mode и `addComposer()` |
+| [`@pkh/plugin-retry-queue`](./packages/plugin-retry-queue) | Персистентная очередь повторов (`bot_data/retry_queue.json`) с экспоненциальным backoff, дедупликацией и Dead-Letter Queue (DLQ) с алертами в Telegram |
+| [`@pkh/plugin-automation`](./packages/plugin-automation) | 9 независимых плагинов автоматизации с `try/catch`-изоляцией, идемпотентностью и автоматическим fallback в очередь повторов |
+| [`@pkh/plugin-telegram`](./packages/plugin-telegram) | Полноценный Telegram-интерфейс на `grammY` с пагинацией, фильтрами, FSM, Setup Mode, управлением DLQ и `addComposer()` |
 | [`@pkh/app`](./packages/app) | Точка входа, Setup Mode с авто-перепроверкой и CLI `pkh` |
 
 ---
@@ -175,7 +177,7 @@ export function apply(ctx) {
 - **Строгая валидация конфигов (Zod) и обязательные плагины (`plugins.required`)**: плагины могут экспортировать `Config = z.object(...)`, а `TelegramService` и `verifyRequiredPlugins()` валидируют параметры до старта и громко сообщают об ошибке.
 - **Безопасные асинхронные эффекты и таймеры**: `safeEffect()` и `safeInterval()` гарантируют логирование и проброс ошибок инициализации (защита от тихого падения async-эффектов) и автоматический `clearInterval`/cleanup при выгрузке.
 - **Идемпотентность и мьютексы**: `StorageService.runExclusive()` сериализует конкурентные записи; `idempotency.json` гарантирует, что дублирующиеся события `NEW_DEAL` никогда не спишут товар дважды.
-- **Изоляция ошибок**: каждый обработчик событий обёрнут в `try/catch`, а `PlayerokService.dispatchEvent` изолирует падение одного плагина от остальных.
+- **Изоляция ошибок и персистентная очередь повторов (`@pkh/plugin-retry-queue`)**: каждый обработчик событий обёрнут в `try/catch`, а сбои API при авто-выдаче, авто-подтверждении, авто-возврате ЧС, восстановлении и поднятии автоматически попадают в персистентную очередь с экспоненциальным backoff и Dead-Letter Queue (DLQ) с алертами и ручным перезапуском из Telegram.
 - **Маскирование секретов**: `LogSinkService` автоматически заменяет токены Telegram, cookies, Bearer-токены и пароли на `[REDACTED]` перед выводом в консоль и файл логов.
 - **Атомарная запись и бэкапы**: запись конфигов идёт через временный файл + `fsync` + `rename`; повреждённый JSON сохраняется в `.bak` и автоматически восстанавливается по Zod-схеме.
 - **Корректная работа с API**: транспорт использует стандартные HTTP/WebSocket-запросы без обхода антибот-защит; при получении challenge-страницы поднимается `BotCheckDetectedError` и активируется Setup Mode.
@@ -186,7 +188,7 @@ export function apply(ctx) {
 
 ```bash
 pnpm lint       # ESLint + typescript-eslint
-pnpm build      # Сборка всех 5 пакетов
+pnpm build      # Сборка всех 6 пакетов
 pnpm typecheck  # Строгая проверка типов (tsc --noEmit)
 pnpm test       # Vitest: unit + integration + local HTTP/WS server
 ```

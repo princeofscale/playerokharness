@@ -10,6 +10,7 @@
     { "path": "../core" },
     { "path": "../playerok" },
     { "path": "../plugin-automation" },
+    { "path": "../plugin-retry-queue" },
     { "path": "../plugin-telegram" }
   ]
 }

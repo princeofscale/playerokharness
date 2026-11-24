@@ -14,6 +14,7 @@ import {
   type MyItem,
 } from '@pkh/core';
 import '@pkh/adapter';
+import '@pkh/plugin-retry-queue';
 
 export interface AutoRestoreConfig {
   expiredCheckIntervalMs?: number;
@@ -129,6 +130,7 @@ export class AutoRestoreService extends Service {
     itemId: string,
     rawPrice: number,
     isPremium: boolean,
+    enqueueOnFail = false,
   ): Promise<{ item: MyItem; status: ItemPriorityStatus }> {
     const cfg = this.ctx.storage.getConfig().playerok.auto_restore_items;
     const statuses = await this.ctx.playerok.getItemPriorityStatuses(itemId, rawPrice);
@@ -147,16 +149,34 @@ export class AutoRestoreService extends Service {
       chosen = free ?? statuses[0];
     }
 
+    const enqueuePublishFailure = async (statusId: string, err: unknown) => {
+      if (!enqueueOnFail) return;
+      const retryQueue = this.ctx.get('retryQueue', false);
+      if (!retryQueue) return;
+      await retryQueue.enqueue({
+        kind: 'publish_item',
+        payload: { itemId, priorityStatusId: statusId },
+        dedupeKey: `publish:${itemId}`,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    };
+
     try {
       const published = await this.ctx.playerok.publishItem(itemId, chosen.id);
       return { item: published, status: chosen };
     } catch (err) {
       if (chosen.type === PriorityTypes.PREMIUM || !prem || !cfg.premium) {
+        await enqueuePublishFailure(chosen.id, err);
         throw err;
       }
       this.log.warn(`Не удалось восстановить с бесплатным статусом, пробую премиум`);
-      const published = await this.ctx.playerok.publishItem(itemId, prem.id);
-      return { item: published, status: prem };
+      try {
+        const published = await this.ctx.playerok.publishItem(itemId, prem.id);
+        return { item: published, status: prem };
+      } catch (premErr) {
+        await enqueuePublishFailure(prem.id, premErr);
+        throw premErr;
+      }
     }
   }
 
@@ -249,7 +269,7 @@ export class AutoRestoreService extends Service {
         if (prepared) {
           await this.ctx.playerok.updateItem(item.id, { dataFields: prepared.fields });
         }
-        const res = await this.publishRestoredItem(item.id, item.rawPrice, isPremium);
+        const res = await this.publishRestoredItem(item.id, item.rawPrice, isPremium, true);
         newItem = res.item;
         chosenStatus = res.status;
         if (prepared) {
