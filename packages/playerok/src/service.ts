@@ -20,7 +20,7 @@ import {
   type Transaction,
   type UserProfile,
   type VerifiedCard,
-} from '@playerok/core';
+} from '@pkh/core';
 import {
   AccountBlockedError,
   BotCheckDetectedError,
@@ -258,14 +258,19 @@ export class PlayerokService extends Service {
   public async dispatchEvent(event: PlayerokEvent): Promise<void> {
     const cordisEvent = EVENT_TYPE_TO_CORDIS[event.type];
     if (!cordisEvent) return;
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      await (this.ctx.parallel as any)(cordisEvent, event);
-    } catch (err) {
-      this.log.error(
-        `Ошибка в обработчике события ${String(cordisEvent)}: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
+    const hooks = [...(this.ctx.events._hooks[cordisEvent] ?? [])];
+    await Promise.all(
+      hooks.map(async (hook) => {
+        if (hook.removed) return;
+        try {
+          await hook.callback(event);
+        } catch (err) {
+          this.log.error(
+            `Ошибка в обработчике события ${String(cordisEvent)}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }),
+    );
   }
 
   public isSupportOrSystemChat(chatId: string): boolean {

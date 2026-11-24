@@ -16,6 +16,7 @@ import {
   DEFAULT_CONFIG,
   DEFAULT_MESSAGES,
   FastRepliesSchema,
+  IdempotencyStoreSchema,
   IncludeExcludeSchema,
   MessagesSettingsSchema,
   OwnerLinkSchema,
@@ -30,6 +31,7 @@ import {
   type CustomCommandsSettings,
   type DataReplacementRule,
   type FastReply,
+  type IdempotencyStore,
   type IncludeExcludeSettings,
   type MessagesSettings,
   type OwnerLink,
@@ -156,11 +158,36 @@ export class StorageService extends Service {
 
   public readonly baseDir: string;
   private readonly specs: Map<string, StoreSpec<unknown>> = new Map();
+  private readonly queues: Map<string, Promise<unknown>> = new Map();
 
   constructor(ctx: Context, config: StorageConfig) {
     super(ctx, 'storage');
     this.baseDir = path.resolve(config.baseDir);
     this.registerBuiltInStores();
+  }
+
+  /**
+   * Serializes read-modify-write operations on a given store key to prevent race conditions
+   * when multiple order/message events are handled concurrently.
+   */
+  public async runExclusive<T>(storeKey: string, task: () => Promise<T> | T): Promise<T> {
+    const prev = this.queues.get(storeKey) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const chained = prev.then(() => gate);
+    this.queues.set(storeKey, chained);
+
+    await prev;
+    try {
+      return await task();
+    } finally {
+      release();
+      if (this.queues.get(storeKey) === chained) {
+        this.queues.delete(storeKey);
+      }
+    }
   }
 
   private registerBuiltInStores(): void {
@@ -313,6 +340,14 @@ export class StorageService extends Service {
       restoreMissing: false,
       exportable: false,
     });
+    this.registerStore<IdempotencyStore>({
+      name: 'idempotency',
+      relativePath: 'bot_data/idempotency.json',
+      schema: IdempotencyStoreSchema,
+      defaultValue: () => ({ delivered_deals: {}, completed_deals: {} }),
+      restoreMissing: true,
+      exportable: false,
+    });
   }
 
   public registerStore<T>(spec: StoreSpec<T>): void {
@@ -354,9 +389,58 @@ export class StorageService extends Service {
     return this.set<T>(name, next === undefined ? current : next);
   }
 
-  // Typed convenience accessors
+  // Typed convenience accessors (with environment variable secret overrides)
   public getConfig(): BotConfig {
-    return this.get<BotConfig>('config');
+    const cfg = this.get<BotConfig>('config');
+    if (process.env.PKH_TELEGRAM_TOKEN) {
+      cfg.telegram.api.token = process.env.PKH_TELEGRAM_TOKEN;
+    }
+    if (process.env.PKH_TELEGRAM_API_URL) {
+      cfg.telegram.api.custom_api_url = process.env.PKH_TELEGRAM_API_URL;
+    }
+    if (process.env.PKH_TELEGRAM_PROXY) {
+      cfg.telegram.api.proxy = process.env.PKH_TELEGRAM_PROXY;
+    }
+    if (process.env.PKH_PLAYEROK_COOKIES) {
+      cfg.playerok.api.cookies = process.env.PKH_PLAYEROK_COOKIES;
+    }
+    if (process.env.PKH_PLAYEROK_PROXY) {
+      cfg.playerok.api.proxy = process.env.PKH_PLAYEROK_PROXY;
+    }
+    if (process.env.PKH_PLAYEROK_USER_AGENT) {
+      cfg.playerok.api.user_agent = process.env.PKH_PLAYEROK_USER_AGENT;
+    }
+    return cfg;
+  }
+
+  public isDealDelivered(dealId: string): boolean {
+    const store = this.get<IdempotencyStore>('idempotency');
+    return Boolean(store.delivered_deals[dealId]);
+  }
+
+  public markDealDelivered(dealId: string): void {
+    this.update<IdempotencyStore>('idempotency', (store) => {
+      store.delivered_deals[dealId] = new Date().toISOString();
+      const keys = Object.keys(store.delivered_deals);
+      if (keys.length > 5000) {
+        delete store.delivered_deals[keys[0]];
+      }
+    });
+  }
+
+  public isDealCompleted(dealId: string): boolean {
+    const store = this.get<IdempotencyStore>('idempotency');
+    return Boolean(store.completed_deals[dealId]);
+  }
+
+  public markDealCompleted(dealId: string): void {
+    this.update<IdempotencyStore>('idempotency', (store) => {
+      store.completed_deals[dealId] = new Date().toISOString();
+      const keys = Object.keys(store.completed_deals);
+      if (keys.length > 5000) {
+        delete store.completed_deals[keys[0]];
+      }
+    });
   }
 
   public setConfig(config: BotConfig): BotConfig {

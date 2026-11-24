@@ -1,4 +1,4 @@
-import type { Context } from '@playerok/core';
+import type { Context } from '@pkh/core';
 import { ordersCachePlugin } from './plugins/orders-cache.js';
 import { blacklistPlugin } from './plugins/blacklist.js';
 import { messagesPlugin } from './plugins/messages.js';
@@ -27,7 +27,7 @@ export interface AutomationBundleConfig {
 }
 
 /**
- * Mounts all standard PlayerOK Universal automation plugins into a Cordis Context.
+ * Mounts all standard PlayerOK Harness automation plugins into a Cordis Context.
  */
 export const automationBundle = {
   name: 'automation-bundle',

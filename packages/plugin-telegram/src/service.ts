@@ -20,10 +20,10 @@ import {
   type NotificationPayload,
   type SellerCallPayload,
   type SetupProblem,
-} from '@playerok/core';
-import '@playerok/adapter';
-import '@playerok/plugin-automation';
-import type { StatsPeriod } from '@playerok/plugin-automation';
+} from '@pkh/core';
+import '@pkh/adapter';
+import '@pkh/plugin-automation';
+import type { StatsPeriod } from '@pkh/plugin-automation';
 import {
   InputStateStore,
   type BindingBucket,
@@ -383,7 +383,7 @@ export class TelegramService extends Service {
       const plugins = this.ctx.plugins.list();
       const activePlugins = plugins.filter((p) => p.enabled).length;
       const text = [
-        '<b>📊 Статус PlayerOK Universal v2</b>',
+        '<b>📊 Статус PlayerOK Harness</b>',
         '',
         `Аккаунт: <b>${escapeHtml(acc?.username ?? 'не подключен')}</b>`,
         `Режим: <b>${this.ctx.playerok?.setupProblem ? 'SETUP MODE' : this.ctx.playerok?.isDryRun ? 'DRY-RUN' : 'LIVE'}</b>`,
@@ -985,8 +985,8 @@ export class TelegramService extends Service {
     if (section === 'cfg' && arg1 === 'export') {
       await gctx.answerCallbackQuery();
       const snapshot = JSON.stringify(storage.exportSnapshot(), null, 2);
-      const file = new InputFile(Buffer.from(snapshot, 'utf8'), `playerok-config-${Date.now()}.json`);
-      await gctx.replyWithDocument(file, { caption: '🗂 Экспорт настроек и данных PlayerOK Universal v2' });
+      const file = new InputFile(Buffer.from(snapshot, 'utf8'), `pkh-config-${Date.now()}.json`);
+      await gctx.replyWithDocument(file, { caption: '🗂 Экспорт настроек и данных PlayerOK Harness (pkh)' });
       return;
     }
 

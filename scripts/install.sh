@@ -2,9 +2,9 @@
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SERVICE_NAME="playerok-universal-v2"
+SERVICE_NAME="playerokharness"
 
-echo "==> Установка PlayerOK Universal v2 из ${APP_DIR}"
+echo "==> Установка PlayerOK Harness (pkh) из ${APP_DIR}"
 
 if ! command -v node >/dev/null 2>&1; then
   echo "Ошибка: требуется Node.js >= 20 (https://nodejs.org)"
@@ -23,7 +23,7 @@ pnpm build
 if command -v systemctl >/dev/null 2>&1 && [[ "$(id -u)" -eq 0 ]]; then
   cat >/etc/systemd/system/${SERVICE_NAME}.service <<EOF
 [Unit]
-Description=PlayerOK Universal v2 (Cordis 4 + TypeScript)
+Description=PlayerOK Harness (pkh) — Cordis 4 + TypeScript
 After=network-online.target
 Wants=network-online.target
 
@@ -39,11 +39,12 @@ Environment=NODE_ENV=production
 WantedBy=multi-user.target
 EOF
 
-  cat >/usr/local/bin/pluniversal2 <<EOF
+  cat >/usr/local/bin/pkh <<EOF
 #!/usr/bin/env bash
 case "\${1:-status}" in
   setup)    node "${APP_DIR}/packages/app/dist/cli.js" setup --data-dir "${APP_DIR}" ;;
   doctor)   node "${APP_DIR}/packages/app/dist/cli.js" doctor --data-dir "${APP_DIR}" ;;
+  plugins)  node "${APP_DIR}/packages/app/dist/cli.js" plugins --data-dir "${APP_DIR}" ;;
   start)    systemctl start ${SERVICE_NAME} ;;
   stop)     systemctl stop ${SERVICE_NAME} ;;
   restart)  systemctl restart ${SERVICE_NAME} ;;
@@ -52,13 +53,13 @@ case "\${1:-status}" in
   disable)  systemctl disable ${SERVICE_NAME} ;;
   log)      journalctl -u ${SERVICE_NAME} -f ;;
   log100)   journalctl -u ${SERVICE_NAME} -n 100 --no-pager ;;
-  *)        echo "Использование: pluniversal2 {setup|doctor|start|stop|restart|status|enable|disable|log|log100}" ;;
+  *)        echo "Использование: pkh {setup|doctor|plugins|start|stop|restart|status|enable|disable|log|log100}" ;;
 esac
 EOF
-  chmod +x /usr/local/bin/pluniversal2
+  chmod +x /usr/local/bin/pkh
   systemctl daemon-reload
-  echo "✅ Установлен systemd-сервис ${SERVICE_NAME} и команда pluniversal2"
-  echo "   Запустите первичную настройку: pluniversal2 setup"
+  echo "✅ Установлен systemd-сервис ${SERVICE_NAME} и команда pkh"
+  echo "   Запустите первичную настройку: pkh setup"
 else
   echo "✅ Сборка завершена. Запустите настройку:"
   echo "   node ${APP_DIR}/packages/app/dist/cli.js setup"

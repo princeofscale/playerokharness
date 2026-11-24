@@ -1,12 +1,12 @@
 import http from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocketServer } from 'ws';
-import { EventTypes, type PlayerokEvent } from '@playerok/core';
+import { EventTypes, type PlayerokEvent } from '@pkh/core';
 import {
   BotCheckDetectedError,
   GraphQLPlayerokTransport,
   UnauthorizedError,
-} from '@playerok/adapter';
+} from '@pkh/adapter';
 
 interface TestServer {
   baseUrl: string;

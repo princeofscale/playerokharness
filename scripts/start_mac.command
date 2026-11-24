@@ -10,7 +10,7 @@ if [ ! -d "node_modules" ]; then
 fi
 
 if [ ! -f "packages/app/dist/cli.js" ]; then
-  echo "Собираю PlayerOK Universal v2..."
+  echo "Собираю PlayerOK Harness (pkh)..."
   pnpm build
 fi
 

@@ -18,7 +18,7 @@ import type {
   TransactionProviderIds,
   UserProfile,
   VerifiedCard,
-} from '@playerok/core';
+} from '@pkh/core';
 
 export interface BinaryUpload {
   filename: string;

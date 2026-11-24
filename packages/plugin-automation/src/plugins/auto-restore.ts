@@ -12,8 +12,8 @@ import {
   type ItemPriorityStatus,
   type ItemProfile,
   type MyItem,
-} from '@playerok/core';
-import '@playerok/adapter';
+} from '@pkh/core';
+import '@pkh/adapter';
 
 export interface AutoRestoreConfig {
   expiredCheckIntervalMs?: number;
@@ -32,21 +32,27 @@ export class AutoRestoreService extends Service {
     this.log = ctx.logger('automation.restore');
 
     ctx.on('playerok/item-paid', async (event) => {
-      if (event.deal.user.id === ctx.playerok.account?.id) return;
-      if (!ctx.storage.getConfig().playerok.auto_restore_items.sold) return;
+      try {
+        if (event.deal.user.id === ctx.playerok.account?.id) return;
+        if (!ctx.storage.getConfig().playerok.auto_restore_items.sold) return;
 
-      const soldItems = await ctx.playerok.getMyItems({
-        count: 24,
-        statuses: [ItemStatuses.SOLD],
-      });
-      const target = soldItems.find(
-        (it) =>
-          it.id === event.deal.item.id ||
-          (it.name === event.deal.item.name &&
-            (!event.deal.item.priority || it.priority === event.deal.item.priority)),
-      );
-      if (target) {
-        await this.restoreItem(target);
+        const soldItems = await ctx.playerok.getMyItems({
+          count: 24,
+          statuses: [ItemStatuses.SOLD],
+        });
+        const target = soldItems.find(
+          (it) =>
+            it.id === event.deal.item.id ||
+            (it.name === event.deal.item.name &&
+              (!event.deal.item.priority || it.priority === event.deal.item.priority)),
+        );
+        if (target) {
+          await this.restoreItem(target);
+        }
+      } catch (err) {
+        this.log.error(
+          `Ошибка обработчика item-paid: ${err instanceof Error ? err.message : String(err)}`,
+        );
       }
     });
 
@@ -159,7 +165,7 @@ export class AutoRestoreService extends Service {
     if (!this.isRestoreMatched(itemOrProfile)) return false;
 
     try {
-      let item: MyItem =
+      const item: MyItem =
         'mayBePublished' in itemOrProfile
           ? itemOrProfile
           : await this.ctx.playerok.getItem({ id: itemOrProfile.id });

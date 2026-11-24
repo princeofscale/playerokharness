@@ -1,5 +1,5 @@
-import { ItemDealStatuses, type CachedOrder, type CachedOrders, type Context } from '@playerok/core';
-import '@playerok/adapter';
+import { ItemDealStatuses, type CachedOrder, type CachedOrders, type Context } from '@pkh/core';
+import '@pkh/adapter';
 
 export interface OrdersStatsSummary {
   totalDeals: number;
@@ -67,29 +67,43 @@ export const ordersCachePlugin = {
   name: 'automation:orders-cache',
   inject: ['storage', 'playerok'],
   apply(ctx: Context): void {
-    ctx.on('playerok/new-deal', (event) => {
-      if (event.deal.user.id === ctx.playerok.account?.id) return;
+    const log = ctx.logger('automation.orders');
 
-      const entry: CachedOrder = {
-        id: event.deal.id,
-        price: event.deal.item.price,
-        status: event.deal.status,
-        date: new Date().toISOString(),
-        item_id: event.deal.item.id,
-        item_name: event.deal.item.name,
-      };
-      ctx.storage.update<CachedOrders>('cached_orders', (orders) => {
-        orders[entry.id] = entry;
-      });
+    ctx.on('playerok/new-deal', async (event) => {
+      try {
+        if (event.deal.user.id === ctx.playerok.account?.id) return;
+
+        const entry: CachedOrder = {
+          id: event.deal.id,
+          price: event.deal.item.price,
+          status: event.deal.status,
+          date: new Date().toISOString(),
+          item_id: event.deal.item.id,
+          item_name: event.deal.item.name,
+        };
+        await ctx.storage.runExclusive('cached_orders', () => {
+          ctx.storage.update<CachedOrders>('cached_orders', (orders) => {
+            orders[entry.id] = entry;
+          });
+        });
+      } catch (err) {
+        log.error(`Ошибка кэширования сделки: ${err instanceof Error ? err.message : String(err)}`);
+      }
     });
 
-    ctx.on('playerok/deal-status-changed', (event) => {
-      if (event.deal.user.id === ctx.playerok.account?.id) return;
-      ctx.storage.update<CachedOrders>('cached_orders', (orders) => {
-        if (orders[event.deal.id]) {
-          orders[event.deal.id].status = event.deal.status;
-        }
-      });
+    ctx.on('playerok/deal-status-changed', async (event) => {
+      try {
+        if (event.deal.user.id === ctx.playerok.account?.id) return;
+        await ctx.storage.runExclusive('cached_orders', () => {
+          ctx.storage.update<CachedOrders>('cached_orders', (orders) => {
+            if (orders[event.deal.id]) {
+              orders[event.deal.id].status = event.deal.status;
+            }
+          });
+        });
+      } catch (err) {
+        log.error(`Ошибка обновления статуса заказа: ${err instanceof Error ? err.message : String(err)}`);
+      }
     });
   },
 };

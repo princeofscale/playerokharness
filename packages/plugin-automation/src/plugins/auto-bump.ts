@@ -10,8 +10,8 @@ import {
   type BumpedItems,
   type ItemProfile,
   type MyItem,
-} from '@playerok/core';
-import '@playerok/adapter';
+} from '@pkh/core';
+import '@pkh/adapter';
 
 export interface TrackedPosition {
   name: string;

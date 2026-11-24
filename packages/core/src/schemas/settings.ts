@@ -25,8 +25,8 @@ export const BotConfigSchema = z.object({
     }).default({ cookies: '', user_agent: '', proxy: '', requests_timeout: 30 }),
     watermark: z.object({
       enabled: z.boolean().default(true),
-      value: z.string().default('©️ 𝗣𝗹𝗮𝘆𝗲𝗿𝗼𝗸 𝗨𝗻𝗶𝘃𝗲𝗿𝘀𝗮𝗹'),
-    }).default({ enabled: true, value: '©️ 𝗣𝗹𝗮𝘆𝗲𝗿𝗼𝗸 𝗨𝗻𝗶𝘃𝗲𝗿𝘀𝗮𝗹' }),
+      value: z.string().default('©️ PlayerOK Harness'),
+    }).default({ enabled: true, value: '©️ PlayerOK Harness' }),
     read_chat: z.boolean().default(true),
     auto_restore_items: z.object({
       sold: z.boolean().default(true),
@@ -274,6 +274,12 @@ export const BootMarkerSchema = z.object({
 });
 export type BootMarker = z.infer<typeof BootMarkerSchema>;
 
+export const IdempotencyStoreSchema = z.object({
+  delivered_deals: z.record(z.string(), z.string()).default({}),
+  completed_deals: z.record(z.string(), z.string()).default({}),
+});
+export type IdempotencyStore = z.infer<typeof IdempotencyStoreSchema>;
+
 export const DEFAULT_CONFIG: BotConfig = {
   playerok: {
     api: {
@@ -284,7 +290,7 @@ export const DEFAULT_CONFIG: BotConfig = {
     },
     watermark: {
       enabled: true,
-      value: '©️ 𝗣𝗹𝗮𝘆𝗲𝗿𝗼𝗸 𝗨𝗻𝗶𝘃𝗲𝗿𝘀𝗮𝗹',
+      value: '©️ PlayerOK Harness',
     },
     read_chat: true,
     auto_restore_items: {
@@ -372,7 +378,7 @@ export const DEFAULT_MESSAGES: MessagesSettings = {
     label: '👋 Приветствие',
     enabled: true,
     text: [
-      '👋 Привет, {user.username}, я бот-помощник 𝗣𝗹𝗮𝘆𝗲𝗿𝗼𝗸 𝗨𝗻𝗶𝘃𝗲𝗿𝘀𝗮𝗹',
+      '👋 Привет, {user.username}, я бот-помощник PlayerOK Harness',
       '',
       '💡 Если вы хотите поговорить с продавцом, напишите команду !продавец, чтобы я пригласил его в этот диалог',
     ],

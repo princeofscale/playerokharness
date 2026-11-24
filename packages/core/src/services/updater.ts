@@ -43,7 +43,7 @@ export class UpdaterService extends Service {
   constructor(ctx: Context, config: UpdaterConfig) {
     super(ctx, 'updater');
     this.log = ctx.logger('updater');
-    this.repo = config.repo ?? 'alleexxeeyy/playerok-universal';
+    this.repo = config.repo ?? 'princeofscale/playerokharness';
     this.currentVersion = config.currentVersion;
 
     if (config.enableTimer !== false) {
@@ -69,7 +69,7 @@ export class UpdaterService extends Service {
       const resp = await fetch(`https://api.github.com/repos/${this.repo}/releases?per_page=10`, {
         headers: {
           accept: 'application/vnd.github+json',
-          'user-agent': `PlayerokUniversal/${this.currentVersion}`,
+          'user-agent': `PlayerokHarness/${this.currentVersion}`,
         },
         signal: controller.signal,
       });

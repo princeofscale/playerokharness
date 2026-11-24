@@ -30,8 +30,8 @@ import {
   type SetupProblem,
   type Transaction,
   type VerifiedCard,
-} from '@playerok/core';
-import { computeOrdersStats, type StatsPeriod, type TrackedPosition } from '@playerok/plugin-automation';
+} from '@pkh/core';
+import { computeOrdersStats, type StatsPeriod, type TrackedPosition } from '@pkh/plugin-automation';
 import type { BindingBucket, BindingStoreKey } from './fsm.js';
 
 export interface RenderedView {
@@ -84,7 +84,7 @@ const boolIcon = (v: boolean) => (v ? '🟢' : '🔴');
 
 export function renderSetupMode(problem: SetupProblem): RenderedView {
   const text = [
-    '<b>🩺 Режим настройки PlayerOK Universal</b>',
+    '<b>🩺 Режим настройки PlayerOK Harness</b>',
     '',
     '⚠️ <b>Работа с PlayerOK приостановлена:</b>',
     `<blockquote>${escapeHtml(problem.text)}</blockquote>`,
@@ -110,7 +110,7 @@ export function renderMainMenu(dryRun = false, setupProblem: SetupProblem | null
       ? ' <i>(DRY-RUN)</i>'
       : '';
   const text = [
-    `<b>🏠 Playerok Universal</b> v${VERSION}${modeBadge}`,
+    `<b>🏠 PlayerOK Harness</b> v${VERSION}${modeBadge}`,
     'Ваш модульный бот-помощник для PlayerOK (Cordis 4 + TS)',
     ...(setupProblem ? ['', `⚠️ <i>PlayerOK: ${escapeHtml(setupProblem.text)}</i>`] : []),
   ].join('\n');

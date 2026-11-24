@@ -23,8 +23,19 @@ const LEVEL_COLORS: Record<string, string> = {
 };
 const RESET = '\x1b[0m';
 
+/**
+ * Redacts Telegram bot tokens, session cookies, Bearer tokens, and inline passwords
+ * so secrets are never written to console output or log files.
+ */
+export function redactSecrets(input: string): string {
+  return input
+    .replace(/\b\d{7,12}:[A-Za-z0-9_-]{35}\b/g, '[REDACTED_TG_TOKEN]')
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, '$1[REDACTED]')
+    .replace(/(\b(?:token|__ddg5_|session|password|cookie)\s*[:=]\s*)([^\s;,"'}]+)/gi, '$1[REDACTED]');
+}
+
 function formatArgs(args: unknown[]): string {
-  return args
+  const raw = args
     .map((arg) => {
       if (arg instanceof Error) return arg.stack || arg.message;
       if (typeof arg === 'string') return arg;
@@ -35,6 +46,7 @@ function formatArgs(args: unknown[]): string {
       }
     })
     .join(' ');
+  return redactSecrets(raw);
 }
 
 function formatTimestamp(ts: number): string {
@@ -64,7 +76,6 @@ export class LogSinkService extends Service {
       },
     });
 
-    // Periodic log size guard matching clear_logs_task() in bot.py
     ctx.effect(() => {
       const timer = setInterval(() => this.enforceMaxFileSize(), 30_000);
       timer.unref?.();
@@ -75,7 +86,7 @@ export class LogSinkService extends Service {
   private handleMessage(message: Message): void {
     const ts = formatTimestamp(message.ts);
     const label = LEVEL_LABELS[message.type] ?? message.type.toUpperCase();
-    const scope = message.name || 'universal';
+    const scope = message.name || 'pkh';
     const text = formatArgs(message.args);
 
     const plainLine = `[${ts}] [${label}] [${scope}] ${text}`;

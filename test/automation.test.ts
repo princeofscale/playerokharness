@@ -10,15 +10,15 @@ import {
   PriorityTypes,
   type NotificationPayload,
   type SellerCallPayload,
-} from '@playerok/core';
-import { MockPlayerokTransport } from '@playerok/adapter';
-import { computeOrdersStats } from '@playerok/plugin-automation';
-import { createApplication } from '@playerok/app';
+} from '@pkh/core';
+import { MockPlayerokTransport } from '@pkh/adapter';
+import { computeOrdersStats } from '@pkh/plugin-automation';
+import { createApplication } from '@pkh/app';
 
 const tempDirs: string[] = [];
 
 function makeTempDir(): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'playerok-v2-auto-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pkh-test-auto-'));
   tempDirs.push(dir);
   return dir;
 }

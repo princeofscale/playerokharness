@@ -18,12 +18,12 @@ import {
   parseItemRef,
   PluginManagerService,
   StorageService,
-} from '@playerok/core';
+} from '@pkh/core';
 
 const tempDirs: string[] = [];
 
 function makeTempDir(): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'playerok-v2-core-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pkh-test-core-'));
   tempDirs.push(dir);
   return dir;
 }
@@ -34,7 +34,7 @@ afterEach(() => {
   }
 });
 
-describe('@playerok/core utilities', () => {
+describe('@pkh/core utilities', () => {
   it('formats nested templates safely while preserving unknown placeholders', () => {
     const out = formatTemplate('Привет, {user.username}! Товар «{item.name}» ({missing.key})', {
       user: { username: 'Alice' },
@@ -90,7 +90,7 @@ describe('@playerok/core utilities', () => {
   });
 });
 
-describe('@playerok/core Cordis services', () => {
+describe('@pkh/core Cordis services', () => {
   it('restores missing keys, recovers corrupt JSON with .bak, and rebinds items across stores', async () => {
     const dir = makeTempDir();
     const ctx = new Context();

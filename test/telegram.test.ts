@@ -11,7 +11,7 @@ import {
   ItemStatuses,
   PluginManagerService,
   StorageService,
-} from '@playerok/core';
+} from '@pkh/core';
 import {
   Composer,
   InputStateStore,
@@ -33,12 +33,12 @@ import {
   renderWithdrawalSbpBanks,
   TelegramService,
   toGrammyKeyboard,
-} from '@playerok/plugin-telegram';
+} from '@pkh/plugin-telegram';
 
 const tempDirs: string[] = [];
 
 function makeTempDir(): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'playerok-v2-tg-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pkh-test-tg-'));
   tempDirs.push(dir);
   return dir;
 }
@@ -49,10 +49,10 @@ afterEach(() => {
   }
 });
 
-describe('@playerok/plugin-telegram', () => {
+describe('@pkh/plugin-telegram', () => {
   it('renders main menu, setup mode, pagination, filters, bindings, delivery, data_replacement, withdrawal, updates', () => {
     const main = renderMainMenu(true);
-    expect(main.text).toContain('Playerok Universal');
+    expect(main.text).toContain('PlayerOK Harness');
     expect(main.text).toContain('DRY-RUN');
     expect(main.keyboard.inline_keyboard.length).toBeGreaterThan(10);
 

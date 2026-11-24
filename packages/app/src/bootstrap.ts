@@ -11,15 +11,15 @@ import {
   UpdaterService,
   VERSION,
   type SetupProblem,
-} from '@playerok/core';
+} from '@pkh/core';
 import {
   MockPlayerokTransport,
   PlayerokService,
   type MockTransportSeed,
   type PlayerokTransport,
-} from '@playerok/adapter';
-import { automationBundle } from '@playerok/plugin-automation';
-import { TelegramService } from '@playerok/plugin-telegram';
+} from '@pkh/adapter';
+import { automationBundle } from '@pkh/plugin-automation';
+import { TelegramService } from '@pkh/plugin-telegram';
 
 export interface AppOptions {
   dataDir?: string;
@@ -92,7 +92,7 @@ export async function createApplication(options: AppOptions = {}): Promise<Playe
   };
 
   const launchPlayerok = async (): Promise<SetupProblem | null> => {
-    const log = ctx.logger('universal');
+    const log = ctx.logger('pkh');
     await ctx.playerok.reconfigureTransport();
     const problem = await ctx.playerok.diagnose();
     if (problem) {
@@ -118,7 +118,7 @@ export async function createApplication(options: AppOptions = {}): Promise<Playe
       await ctx.parallel('bot/init');
       await ctx.parallel('bot/ready');
       log.info(
-        `PlayerOK Universal готов к работе (аккаунт: ${account.username}, режим: ${ctx.playerok.isDryRun ? 'DRY-RUN' : ctx.playerok.transport.kind})`,
+        `PlayerOK Harness готов к работе (аккаунт: ${account.username}, режим: ${ctx.playerok.isDryRun ? 'DRY-RUN' : ctx.playerok.transport.kind})`,
       );
       if (options.enableTelegram !== false && ctx.telegram?.bot) {
         await ctx.telegram.sendBootReport();
@@ -142,8 +142,8 @@ export async function createApplication(options: AppOptions = {}): Promise<Playe
       if (started) return;
       started = true;
 
-      const log = ctx.logger('universal');
-      log.info(`Запуск PlayerOK Universal v${VERSION} (Cordis 4 + TypeScript)`);
+      const log = ctx.logger('pkh');
+      log.info(`Запуск PlayerOK Harness v${VERSION} (Cordis 4 + TypeScript)`);
 
       if (options.enableInstanceLock !== false) {
         const runningPid = ctx.lock.acquireInstanceLock();

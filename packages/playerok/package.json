@@ -1,6 +1,6 @@
 {
-  "name": "@playerok/adapter",
-  "version": "2.0.0",
+  "name": "@pkh/adapter",
+  "version": "1.0.0",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -15,7 +15,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@playerok/core": "workspace:*",
+    "@pkh/core": "workspace:*",
     "cordis": "4.0.0-rc.13",
     "https-proxy-agent": "^9.1.0",
     "undici": "^8.13.1",

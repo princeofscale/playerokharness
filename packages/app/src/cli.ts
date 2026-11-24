@@ -12,7 +12,7 @@ import {
   normalizeCustomApiUrl,
   StorageService,
   VERSION,
-} from '@playerok/core';
+} from '@pkh/core';
 import { createApplication, runDryRunSimulation } from './bootstrap.js';
 
 interface ParsedArgs {
@@ -49,17 +49,17 @@ function parseArgs(argv: string[]): ParsedArgs {
 
 function printHelp(): void {
   console.log(`
-PlayerOK Universal v${VERSION} (Cordis 4 + TypeScript)
+PlayerOK Harness (pkh) v${VERSION} — Cordis 4 + TypeScript
 
 Использование:
-  playerok [команда] [флаги]
+  pkh [команда] [флаги]
 
 Команды:
-  start          Запустить бота (по умолчанию)
+  start          Запустить PlayerOK Harness (по умолчанию)
   setup          Интерактивная настройка токена Telegram, прокси и cookies PlayerOK
-  doctor         Диагностика конфигурации, путей и готовности к запуску
+  doctor         Диагностика конфигурации, переменных окружения и готовности к запуску
   plugins        Показать установленные внешние плагины в папке plugins/
-  migrate-v1     Скопировать настройки и данные из Python-версии (--from <путь>)
+  import-config  Импортировать JSON-настройки и данные из внешнего каталога (--from <путь>)
 
 Флаги:
   --dry-run            Запуск с MockPlayerokTransport без реальных сетевых запросов
@@ -67,7 +67,7 @@ PlayerOK Universal v${VERSION} (Cordis 4 + TypeScript)
   --no-telegram        Не запускать Telegram-бота
   --data-dir <путь>    Каталог для bot_settings/, bot_data/, logs/, plugins/
   --plugins-dir <путь> Каталог внешних плагинов
-  --from <путь>        Исходный каталог Python v1 для команды migrate-v1
+  --from <путь>        Исходный каталог для команды import-config
   -h, --help           Показать справку
 `);
 }
@@ -79,7 +79,7 @@ async function runSetup(dataDir: string): Promise<void> {
 
   const rl = readline.createInterface({ input, output });
   try {
-    console.log(`\n⚙️ Первичная настройка PlayerOK Universal v${VERSION} (${dataDir})\n`);
+    console.log(`\n⚙️ Первичная настройка PlayerOK Harness (pkh) v${VERSION} (${dataDir})\n`);
     const cfg = ctx.storage.getConfig();
 
     const token = (await rl.question(`Telegram Bot Token [${cfg.telegram.api.token ? 'задан' : 'пусто'}]: `)).trim();
@@ -139,7 +139,7 @@ async function runDoctor(dataDir: string): Promise<void> {
     ['Владельцы Telegram', cfg.telegram.bot.signed_users.length > 0, `авторизовано: ${cfg.telegram.bot.signed_users.length}`],
   ];
 
-  console.log(`\n🩺 Диагностика PlayerOK Universal v${VERSION}\n`);
+  console.log(`\n🩺 Диагностика PlayerOK Harness (pkh) v${VERSION}\n`);
   for (const [label, ok, detail] of checks) {
     console.log(`  ${ok ? '✅' : '⚠️'} ${label}: ${detail}`);
   }
@@ -151,7 +151,7 @@ async function runPluginsList(dataDir: string, pluginsDir?: string): Promise<voi
   const targetDir = path.resolve(pluginsDir ?? path.join(dataDir, 'plugins'));
   fs.mkdirSync(targetDir, { recursive: true });
   const entries = fs.readdirSync(targetDir, { withFileTypes: true });
-  console.log(`\n🔌 Плагины в ${targetDir}:\n`);
+  console.log(`\n🔌 Плагины pkh в ${targetDir}:\n`);
   const filtered = entries.filter((e) => !e.name.startsWith('.') && e.name !== 'node_modules');
   if (filtered.length === 0) {
     console.log('  (пусто — поместите .mjs/.js файл или папку с index.mjs)');
@@ -163,10 +163,10 @@ async function runPluginsList(dataDir: string, pluginsDir?: string): Promise<voi
   console.log('');
 }
 
-async function runMigrateV1(fromDir: string, dataDir: string): Promise<void> {
+async function runImportConfig(fromDir: string, dataDir: string): Promise<void> {
   const srcRoot = path.resolve(fromDir);
   if (!fs.existsSync(srcRoot)) {
-    throw new Error(`Исходный каталог v1 не найден: ${srcRoot}`);
+    throw new Error(`Исходный каталог не найден: ${srcRoot}`);
   }
 
   const folders = ['bot_settings', 'bot_data'];
@@ -185,7 +185,6 @@ async function runMigrateV1(fromDir: string, dataDir: string): Promise<void> {
     }
   }
 
-  // Validate & auto-restore migrated schemas via StorageService
   const ctx = new Context();
   await ctx.use(StorageService, { baseDir: dataDir });
   ctx.storage.getConfig();
@@ -193,7 +192,7 @@ async function runMigrateV1(fromDir: string, dataDir: string): Promise<void> {
   ctx.storage.getBlacklist();
   await ctx.fiber.dispose();
 
-  console.log(`✅ Миграция завершена: скопировано и проверено JSON-файлов: ${copied} (${srcRoot} -> ${dataDir})`);
+  console.log(`✅ Импорт завершён: скопировано и проверено JSON-файлов: ${copied} (${srcRoot} -> ${dataDir})`);
 }
 
 async function main(): Promise<void> {
@@ -203,8 +202,15 @@ async function main(): Promise<void> {
     return;
   }
 
-  const dataDir = path.resolve(typeof flags['data-dir'] === 'string' ? flags['data-dir'] : process.cwd());
-  const pluginsDir = typeof flags['plugins-dir'] === 'string' ? flags['plugins-dir'] : undefined;
+  const dataDir = path.resolve(
+    typeof flags['data-dir'] === 'string'
+      ? flags['data-dir']
+      : process.env.PKH_DATA_DIR || process.cwd(),
+  );
+  const pluginsDir =
+    typeof flags['plugins-dir'] === 'string'
+      ? flags['plugins-dir']
+      : process.env.PKH_PLUGINS_DIR || undefined;
 
   if (command === 'setup') {
     await runSetup(dataDir);
@@ -218,9 +224,12 @@ async function main(): Promise<void> {
     await runPluginsList(dataDir, pluginsDir);
     return;
   }
-  if (command === 'migrate-v1') {
-    const fromDir = typeof flags.from === 'string' ? flags.from : path.resolve(process.cwd(), '..');
-    await runMigrateV1(fromDir, dataDir);
+  if (command === 'import-config') {
+    const fromDir = typeof flags.from === 'string' ? flags.from : '';
+    if (!fromDir) {
+      throw new Error('Укажите исходный каталог через --from <путь>');
+    }
+    await runImportConfig(fromDir, dataDir);
     return;
   }
 
@@ -245,7 +254,7 @@ async function main(): Promise<void> {
   });
 
   const shutdown = async (signal: string) => {
-    app.ctx.logger('universal').info(`Получен сигнал ${signal}, завершаю работу...`);
+    app.ctx.logger('pkh').info(`Получен сигнал ${signal}, завершаю работу...`);
     await app.stop();
     process.exit(0);
   };

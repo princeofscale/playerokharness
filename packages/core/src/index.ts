@@ -1,4 +1,4 @@
-export const VERSION = '2.0.0-alpha.1';
+export const VERSION = '1.0.0';
 
 export { Context, Service, type Component, type Fiber } from 'cordis';
 

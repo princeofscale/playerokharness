@@ -11,14 +11,14 @@ import {
   StorageService,
   UpdaterService,
   type SetupProblem,
-} from '@playerok/core';
-import { MockPlayerokTransport, UnauthorizedError } from '@playerok/adapter';
-import { createApplication } from '@playerok/app';
+} from '@pkh/core';
+import { MockPlayerokTransport, UnauthorizedError } from '@pkh/adapter';
+import { createApplication } from '@pkh/app';
 
 const tempDirs: string[] = [];
 
 function makeTempDir(): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'playerok-v2-life-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pkh-test-life-'));
   tempDirs.push(dir);
   return dir;
 }

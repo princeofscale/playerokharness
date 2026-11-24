@@ -8,7 +8,7 @@ if not exist "node_modules" (
 )
 
 if not exist "packages\app\dist\cli.js" (
-  echo Building PlayerOK Universal v2...
+  echo Building PlayerOK Harness (pkh)...
   call pnpm build
 )
 

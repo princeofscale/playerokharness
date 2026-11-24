@@ -28,7 +28,7 @@ import {
   type Transaction,
   type UserProfile,
   type VerifiedCard,
-} from '@playerok/core';
+} from '@pkh/core';
 import type {
   CreateItemParams,
   GetDealsParams,

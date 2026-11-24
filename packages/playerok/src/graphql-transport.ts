@@ -29,7 +29,7 @@ import {
   type Transaction,
   type UserProfile,
   type VerifiedCard,
-} from '@playerok/core';
+} from '@pkh/core';
 import {
   BotCheckDetectedError,
   RequestFailedError,
@@ -233,7 +233,7 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
       .map(([k, v]) => `${k}=${v}`)
       .join('; ');
     this.userAgent =
-      options.userAgent || 'PlayerokUniversal/2.0 (Node.js; standard HTTP/GraphQL client)';
+      options.userAgent || 'PlayerokHarness/2.0 (Node.js; standard HTTP/GraphQL client)';
     this.proxyUrl = normalizeProxyUrl(options.proxy);
     if (this.proxyUrl) {
       this.fetchDispatcher = new ProxyAgent(this.proxyUrl);

@@ -3,8 +3,8 @@ import {
   isDue,
   Service,
   TransactionProviderIds,
-} from '@playerok/core';
-import '@playerok/adapter';
+} from '@pkh/core';
+import '@pkh/adapter';
 
 export interface AutoWithdrawalConfig {
   tickIntervalMs?: number;
