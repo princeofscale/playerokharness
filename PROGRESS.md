@@ -26,4 +26,7 @@
 - [x] **Идемпотентность и конкурентность**: `StorageService.runExclusive()` + `bot_data/idempotency.json` (`isDealDelivered` / `isDealCompleted`) защищают от двойной выдачи и гонок записи.
 - [x] **Очистка ресурсов без утечек**: все подписки/таймеры/сокеты привязаны к Cordis `Fiber` / `ctx.effect()`, подтверждено тестом многократного `enable`/`disable`.
 - [x] **Безопасность конфигурации и логов**: `.env.example` + `PKH_*` env overrides + `redactSecrets()` в `LogSinkService`.
+- [x] **Безопасные асинхронные эффекты (P0)**: `safeEffect()` + `safeInterval()` — исключают тихое подавление ошибок в async-эффектах и гарантируют очистку всех таймеров (включая `setupMode:autoRecheck`).
+- [x] **Строгая валидация конфигов и обязательных плагинов (P1)**: per-plugin Zod `Config` + `plugins.required` (`verifyRequiredPlugins()`) + строгая валидация `TelegramService` токена до старта.
+- [x] **Изоляция прав внешних плагинов (P2)**: capability-ограниченный контекст для недоверенных плагинов (`plugins.trusted`) скрывает секреты и блокирует `autoWithdrawal` / `access` / `lock` / `setConfig`.
 - [x] **Документация**: переработанный `README.md`, `AGENTS.md`, `LICENSE` (MIT).

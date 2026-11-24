@@ -7,6 +7,7 @@ import {
   LockService,
   LogSinkService,
   PluginManagerService,
+  safeInterval,
   StorageService,
   UpdaterService,
   VERSION,
@@ -82,12 +83,12 @@ export async function createApplication(options: AppOptions = {}): Promise<Playe
   let started = false;
   let stopped = false;
   let playerokLaunched = false;
-  let recheckTimer: NodeJS.Timeout | null = null;
+  let disposeRecheck: (() => Promise<void>) | null = null;
 
   const stopRecheckTimer = () => {
-    if (recheckTimer) {
-      clearInterval(recheckTimer);
-      recheckTimer = null;
+    if (disposeRecheck) {
+      void disposeRecheck();
+      disposeRecheck = null;
     }
   };
 
@@ -114,6 +115,7 @@ export async function createApplication(options: AppOptions = {}): Promise<Playe
     if (!playerokLaunched) {
       playerokLaunched = true;
       await ctx.plugins.discoverAndLoad();
+      ctx.plugins.verifyRequiredPlugins();
       await ctx.playerok.startListening();
       await ctx.parallel('bot/init');
       await ctx.parallel('bot/ready');
@@ -168,12 +170,16 @@ export async function createApplication(options: AppOptions = {}): Promise<Playe
 
         if (options.enableTimers !== false) {
           const interval = options.autoRecheckIntervalMs ?? 5 * 60 * 1000;
-          recheckTimer = setInterval(() => {
-            const current = ctx.playerok.setupProblem;
-            if (!current || !current.transient) return;
-            void launchPlayerok();
-          }, interval);
-          recheckTimer.unref?.();
+          disposeRecheck = safeInterval(
+            ctx,
+            async () => {
+              const current = ctx.playerok.setupProblem;
+              if (!current || !current.transient) return;
+              await launchPlayerok();
+            },
+            interval,
+            'setupMode:autoRecheck',
+          );
         }
       }
     },

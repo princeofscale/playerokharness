@@ -173,6 +173,10 @@ export const BotConfigSchema = z.object({
   logs: z.object({
     max_file_size: z.number().positive().default(512),
   }).default({ max_file_size: 512 }),
+  plugins: z.object({
+    trusted: z.array(z.string()).default([]),
+    required: z.array(z.string()).default([]),
+  }).default({ trusted: [], required: [] }),
 });
 
 export type BotConfig = z.infer<typeof BotConfigSchema>;
@@ -370,6 +374,10 @@ export const DEFAULT_CONFIG: BotConfig = {
   },
   logs: {
     max_file_size: 512,
+  },
+  plugins: {
+    trusted: [],
+    required: [],
   },
 };
 

@@ -3,7 +3,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Context, Service, type Component, type Fiber } from 'cordis';
+import type { z } from 'zod';
+import type { BotConfig } from '../schemas/settings.js';
 import type { ExternalPluginMeta, LoadedPluginRecord, PluginCheckResult } from '../types/models.js';
+import type { StorageService } from './storage.js';
 
 export interface PluginManagerConfig {
   pluginsDir?: string;
@@ -11,23 +14,99 @@ export interface PluginManagerConfig {
 
 export interface ExternalPluginModule {
   meta?: Partial<ExternalPluginMeta>;
+  Config?: z.ZodType<any>;
   default?: Component;
-  apply?: (ctx: Context, config?: unknown) => void | Promise<void>;
+  apply?: (ctx: Context, config?: any) => void | Promise<void>;
   inject?: string[];
   name?: string;
+}
+
+export class PluginPermissionError extends Error {
+  constructor(pluginId: string, resource: string) {
+    super(
+      `Плагин «${pluginId}» не является доверенным (plugins.trusted) и не имеет доступа к «${resource}»`,
+    );
+    this.name = 'PluginPermissionError';
+  }
+}
+
+export class PluginConfigValidationError extends Error {
+  constructor(pluginId: string, details: string) {
+    super(`Некорректная конфигурация плагина «${pluginId}»: ${details}`);
+    this.name = 'PluginConfigValidationError';
+  }
 }
 
 interface ManagedPluginEntry {
   record: LoadedPluginRecord;
   component: Component | null;
+  configSchema?: z.ZodType<any>;
+  trusted: boolean;
   fiber: Fiber | null;
 }
+
+const RESTRICTED_SERVICES = new Set(['autoWithdrawal', 'access', 'lock']);
+const RESTRICTED_STORAGE_KEYS = new Set(['owner_link', 'access_requests', 'config']);
 
 function safePluginId(filename: string): string {
   const base = path.basename(filename).replace(/\.(mjs|js|zip)$/i, '');
   const clean = base.replace(/[^a-zA-Z0-9_-]+/g, '_').replace(/^_+|_+$/g, '');
   if (!clean) return `plugin_${Date.now().toString(36)}`;
   return /^\d/.test(clean) ? `plugin_${clean}` : clean;
+}
+
+function redactConfigForUntrusted(cfg: BotConfig): BotConfig {
+  const copy = structuredClone(cfg);
+  copy.telegram.api.token = '';
+  copy.telegram.bot.password = '';
+  copy.playerok.api.cookies = '';
+  return copy;
+}
+
+function createRestrictedStorageProxy(pluginId: string, storage: StorageService): StorageService {
+  return new Proxy(storage, {
+    get(target, prop, receiver) {
+      if (prop === 'getConfig') {
+        return () => redactConfigForUntrusted(target.getConfig());
+      }
+      if (prop === 'setConfig' || prop === 'updateConfig' || prop === 'exportSnapshot') {
+        return () => {
+          throw new PluginPermissionError(pluginId, `storage.${String(prop)}`);
+        };
+      }
+      if (prop === 'get' || prop === 'set' || prop === 'update') {
+        return (name: string, ...rest: unknown[]) => {
+          if (RESTRICTED_STORAGE_KEYS.has(name)) {
+            throw new PluginPermissionError(pluginId, `storage.${String(prop)}("${name}")`);
+          }
+          return (target as any)[prop](name, ...rest);
+        };
+      }
+      const val = Reflect.get(target, prop, receiver);
+      return typeof val === 'function' ? val.bind(target) : val;
+    },
+  });
+}
+
+function createRestrictedContext(
+  pluginId: string,
+  baseCtx: Context,
+  rootStorage: StorageService,
+): Context {
+  const storageProxy = createRestrictedStorageProxy(pluginId, rootStorage);
+
+  return new Proxy(baseCtx, {
+    get(target, prop, receiver) {
+      if (typeof prop === 'string' && RESTRICTED_SERVICES.has(prop)) {
+        throw new PluginPermissionError(pluginId, `ctx.${prop}`);
+      }
+      if (prop === 'storage') {
+        return storageProxy;
+      }
+      const val = Reflect.get(target, prop, receiver);
+      return typeof val === 'function' ? val.bind(target) : val;
+    },
+  });
 }
 
 export class PluginManagerService extends Service {
@@ -69,10 +148,40 @@ export class PluginManagerService extends Service {
     return entry ? { ...entry.record } : null;
   }
 
+  public isTrusted(id: string): boolean {
+    const trusted = this.ctx.storage.getConfig().plugins.trusted;
+    return trusted.includes(id) || trusted.includes('*');
+  }
+
+  private loadPluginConfig(id: string, schema?: z.ZodType<any>): unknown {
+    const cfgPath = this.ctx.storage.resolvePath(`bot_settings/plugins/${id}.json`);
+    let raw: unknown = {};
+    if (fs.existsSync(cfgPath)) {
+      try {
+        raw = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+      } catch (err) {
+        throw new PluginConfigValidationError(
+          id,
+          `некорректный JSON в ${cfgPath}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    if (!schema) return raw;
+    const parsed = schema.safeParse(raw);
+    if (!parsed.success) {
+      const details = parsed.error.issues
+        .map((i) => `${i.path.join('.') || '<root>'}: ${i.message}`)
+        .join('; ');
+      throw new PluginConfigValidationError(id, details);
+    }
+    return parsed.data;
+  }
+
   public async register(
     meta: ExternalPluginMeta,
     component: Component,
     sourcePath = 'builtin',
+    options: { trusted?: boolean; configSchema?: z.ZodType<any> } = {},
   ): Promise<LoadedPluginRecord> {
     const record: LoadedPluginRecord = {
       id: meta.id,
@@ -80,7 +189,14 @@ export class PluginManagerService extends Service {
       enabled: false,
       sourcePath,
     };
-    this.entries.set(meta.id, { record, component, fiber: null });
+    const trusted = options.trusted ?? (sourcePath === 'builtin' || this.isTrusted(meta.id));
+    this.entries.set(meta.id, {
+      record,
+      component,
+      configSchema: options.configSchema,
+      trusted,
+      fiber: null,
+    });
 
     const disabled = this.ctx.storage.getDisabledModules();
     if (!disabled.includes(meta.id)) {
@@ -125,7 +241,13 @@ export class PluginManagerService extends Service {
         enabled: false,
         sourcePath: entryFile,
       };
-      this.entries.set(id, { record, component, fiber: null });
+      this.entries.set(id, {
+        record,
+        component,
+        configSchema: mod.Config,
+        trusted: this.isTrusted(id),
+        fiber: null,
+      });
 
       if (!disabled.includes(id)) {
         await this.enable(id, false);
@@ -135,7 +257,9 @@ export class PluginManagerService extends Service {
       return { ...record };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      const trace = err instanceof Error ? err.stack || message : message;
       this.log.error(`Ошибка загрузки плагина ${id}: ${message}`);
+      this.ctx.get('bootReport', false)?.addError(id, 'load', trace);
       const failedRecord: LoadedPluginRecord = {
         id,
         meta: { id, name: id, version: '—' },
@@ -146,6 +270,7 @@ export class PluginManagerService extends Service {
       this.entries.set(id, {
         record: failedRecord,
         component: null,
+        trusted: false,
         fiber: null,
       });
       return failedRecord;
@@ -186,8 +311,29 @@ export class PluginManagerService extends Service {
   }
 
   /**
-   * Verifies a plugin file in an isolated Node subprocess with timeout before activating it in the live bot.
+   * Ensures every plugin listed in `config.plugins.required` was found, validated, and enabled.
+   * Throws an explicit diagnostic Error if any required plugin is missing or failed to start.
    */
+  public verifyRequiredPlugins(): void {
+    const required = this.ctx.storage.getConfig().plugins.required;
+    const problems: string[] = [];
+
+    for (const id of required) {
+      const entry = this.entries.get(id);
+      if (!entry) {
+        problems.push(`${id}: плагин не найден в ${this.pluginsDir}`);
+      } else if (entry.record.error) {
+        problems.push(`${id}: ${entry.record.error}`);
+      } else if (!entry.record.enabled) {
+        problems.push(`${id}: плагин не активен`);
+      }
+    }
+
+    if (problems.length > 0) {
+      throw new Error(`Не загружены обязательные плагины: ${problems.join(' | ')}`);
+    }
+  }
+
   public async checkPluginFile(filePath: string, timeoutMs = 15_000): Promise<PluginCheckResult> {
     const id = safePluginId(filePath);
     const hasBackup = fs.existsSync(path.join(this.backupDir, `${id}.mjs`));
@@ -242,9 +388,6 @@ export class PluginManagerService extends Service {
     });
   }
 
-  /**
-   * Installs or updates a single `.mjs`/`.js` plugin with automatic backup, isolated check, and rollback on failure.
-   */
   public async installPluginFile(
     filename: string,
     content: Buffer | string,
@@ -277,7 +420,6 @@ export class PluginManagerService extends Service {
     const check = await this.checkPluginFile(destPath);
 
     if (check.status !== 'ok') {
-      // Rollback cleanly so live bot stays healthy
       if (existed && fs.existsSync(backupPath)) {
         fs.copyFileSync(backupPath, destPath);
         await this.importPluginFile(id, destPath, true);
@@ -318,13 +460,32 @@ export class PluginManagerService extends Service {
     return removed || Boolean(entry);
   }
 
+  private wrapWithPermissions(id: string, component: Component, trusted: boolean): Component {
+    if (trusted) return component;
+    const raw = component as Component.Object & Component.Function & { inject?: string[]; name?: string };
+    const rootStorage = this.ctx.storage;
+    return {
+      name: raw.name ?? id,
+      inject: raw.inject,
+      apply: (childCtx: Context, cfg: unknown) => {
+        const restrictedCtx = createRestrictedContext(id, childCtx, rootStorage);
+        if (typeof component === 'function') {
+          return (component as (ctx: Context, cfg: unknown) => unknown)(restrictedCtx, cfg);
+        }
+        return (component as Component.Object).apply(restrictedCtx, cfg);
+      },
+    };
+  }
+
   public async enable(id: string, persist = true): Promise<boolean> {
     const entry = this.entries.get(id);
     if (!entry || !entry.component) return false;
     if (entry.record.enabled && entry.fiber) return true;
 
     try {
-      const fiber = this.ctx.use(entry.component);
+      const validatedConfig = this.loadPluginConfig(id, entry.configSchema);
+      const wrapped = this.wrapWithPermissions(id, entry.component, entry.trusted || this.isTrusted(id));
+      const fiber = this.ctx.use(wrapped, validatedConfig);
       await fiber;
       entry.fiber = fiber;
       entry.record.enabled = true;
@@ -334,13 +495,17 @@ export class PluginManagerService extends Service {
         this.setPersistedDisabled(id, false);
       }
 
-      this.log.info(`Плагин ${entry.record.meta.name} v${entry.record.meta.version} включён`);
+      this.log.info(
+        `Плагин ${entry.record.meta.name} v${entry.record.meta.version} включён (${entry.trusted ? 'trusted' : 'restricted'})`,
+      );
       await this.ctx.parallel('bot/module-enabled', { ...entry.record });
       return true;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      const trace = err instanceof Error ? err.stack || message : message;
       entry.record.error = message;
       this.log.error(`Не удалось включить плагин ${id}: ${message}`);
+      this.ctx.get('bootReport', false)?.addError(id, 'start', trace);
       return false;
     }
   }

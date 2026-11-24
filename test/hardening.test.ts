@@ -3,13 +3,21 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  AccessService,
+  BlacklistService,
+  BootReportService,
   Context,
   LogSinkService,
   PluginManagerService,
+  PluginPermissionError,
   redactSecrets,
+  safeEffect,
+  safeInterval,
   StorageService,
+  z,
 } from '@pkh/core';
 import { MockPlayerokTransport } from '@pkh/adapter';
+import { TelegramService } from '@pkh/plugin-telegram';
 import { createApplication } from '@pkh/app';
 
 const tempDirs: string[] = [];
@@ -187,6 +195,165 @@ describe('Reliability, idempotency, concurrency & security hardening', () => {
     await ctx.parallel('bot/init');
     // Must be called exactly ONCE, proving zero listener accumulation
     expect(calls).toBe(1);
+
+    await ctx.fiber.dispose();
+  });
+
+  it('P0: safeEffect propagates async init errors (never silent) and runs cleanup on dispose', async () => {
+    const dir = makeTempDir();
+    const ctx = new Context();
+    await ctx.use(StorageService, { baseDir: dir });
+    await ctx.use(LogSinkService, { silentConsole: true });
+
+    await expect(
+      safeEffect(
+        ctx,
+        async () => {
+          throw new Error('TCP handshake failed');
+        },
+        'test:tcpInit',
+      ),
+    ).rejects.toThrow('TCP handshake failed');
+
+    expect(ctx.logSink.getRecentLines(10).join('\n')).toContain('TCP handshake failed');
+
+    let cleaned = false;
+    await safeEffect(
+      ctx,
+      async () => {
+        return () => {
+          cleaned = true;
+        };
+      },
+      'test:cleanable',
+    );
+    expect(cleaned).toBe(false);
+    await ctx.fiber.dispose();
+    expect(cleaned).toBe(true);
+  });
+
+  it('P2: safeInterval stops firing automatically after context dispose (no zombie timers)', async () => {
+    const dir = makeTempDir();
+    const ctx = new Context();
+    await ctx.use(StorageService, { baseDir: dir });
+
+    let ticks = 0;
+    safeInterval(
+      ctx,
+      () => {
+        ticks += 1;
+      },
+      15,
+      'test:ticker',
+    );
+
+    await new Promise((r) => setTimeout(r, 55));
+    const ticksBeforeDispose = ticks;
+    expect(ticksBeforeDispose).toBeGreaterThanOrEqual(2);
+
+    await ctx.fiber.dispose();
+    await new Promise((r) => setTimeout(r, 60));
+    expect(ticks).toBe(ticksBeforeDispose);
+  });
+
+  it('P1: validates plugin Zod config schema and enforces required plugins loudly', async () => {
+    const dir = makeTempDir();
+    const ctx = new Context();
+    await ctx.use(StorageService, { baseDir: dir });
+    await ctx.use(BootReportService);
+    await ctx.use(PluginManagerService, { pluginsDir: path.join(dir, 'plugins') });
+
+    const schema = z.object({
+      apiEndpoint: z.string().url(),
+      retries: z.number().int().positive(),
+    });
+
+    // Missing required config fields -> must fail validation & record boot error!
+    await ctx.plugins.register(
+      { id: 'strict_plugin', name: 'Strict Plugin', version: '1.0.0' },
+      { name: 'strict_plugin', apply: () => {} },
+      'external',
+      { configSchema: schema },
+    );
+
+    const rec = ctx.plugins.get('strict_plugin');
+    expect(rec?.enabled).toBe(false);
+    expect(rec?.error).toContain('Некорректная конфигурация плагина');
+    expect(ctx.bootReport.getErrors().some((e) => e.module === 'strict_plugin')).toBe(true);
+
+    // Missing required plugin throws loud diagnostic error
+    ctx.storage.updateConfig((cfg) => {
+      cfg.plugins.required = ['nonexistent_plugin'];
+    });
+    expect(() => ctx.plugins.verifyRequiredPlugins()).toThrow('nonexistent_plugin');
+
+    await ctx.fiber.dispose();
+  });
+
+  it('P1: TelegramService rejects malformed bot token before startup', async () => {
+    const dir = makeTempDir();
+    const ctx = new Context();
+    await ctx.use(StorageService, { baseDir: dir });
+    await ctx.use(AccessService);
+    await ctx.use(BlacklistService);
+    await ctx.use(PluginManagerService);
+
+    await expect(async () => {
+      await ctx.use(TelegramService, { token: 'invalid-token-format' });
+    }).rejects.toThrow('Некорректный формат Telegram Bot Token');
+
+    await ctx.fiber.dispose();
+  });
+
+  it('P2: isolates untrusted external plugins from secrets and sensitive services', async () => {
+    const dir = makeTempDir();
+    const ctx = new Context();
+    await ctx.use(StorageService, { baseDir: dir });
+    await ctx.use(AccessService);
+    await ctx.use(PluginManagerService);
+
+    ctx.storage.updateConfig((cfg) => {
+      cfg.telegram.api.token = '123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi';
+      cfg.playerok.api.cookies = 'token=top_secret_cookie';
+      cfg.telegram.bot.password = 'super_secret_pw';
+    });
+
+    let seenToken = 'UNSET';
+    let seenCookies = 'UNSET';
+    let accessBlocked = false;
+    let setConfigBlocked = false;
+
+    await ctx.plugins.register(
+      { id: 'untrusted_mod', name: 'Untrusted Mod', version: '1.0.0' },
+      {
+        name: 'untrusted_mod',
+        apply(pluginCtx) {
+          const cfg = pluginCtx.storage.getConfig();
+          seenToken = cfg.telegram.api.token;
+          seenCookies = cfg.playerok.api.cookies;
+
+          try {
+            // eslint-disable-next-line @typescript-eslint/no-unused-expressions
+            pluginCtx.access;
+          } catch (err) {
+            accessBlocked = err instanceof PluginPermissionError;
+          }
+
+          try {
+            pluginCtx.storage.setConfig(cfg);
+          } catch (err) {
+            setConfigBlocked = err instanceof PluginPermissionError;
+          }
+        },
+      },
+      'plugins/untrusted_mod.mjs',
+      { trusted: false },
+    );
+
+    expect(seenToken).toBe('');
+    expect(seenCookies).toBe('');
+    expect(accessBlocked).toBe(true);
+    expect(setConfigBlocked).toBe(true);
 
     await ctx.fiber.dispose();
   });

@@ -3,6 +3,7 @@ import { HttpsProxyAgent } from 'https-proxy-agent';
 import {
   Context,
   escapeHtml,
+  isTgTokenValid,
   ItemDealStatuses,
   ItemStatuses,
   normalizeCustomApiUrl,
@@ -105,6 +106,11 @@ export class TelegramService extends Service {
     const apiRoot = rawApiUrl ? normalizeCustomApiUrl(rawApiUrl) : undefined;
 
     if (token) {
+      if (!isTgTokenValid(token)) {
+        throw new Error(
+          'Некорректный формат Telegram Bot Token (ожидается <digits>:<35-char secret>). Проверьте config.json или PKH_TELEGRAM_TOKEN.',
+        );
+      }
       const clientOpts: Record<string, unknown> = {};
       if (apiRoot) clientOpts.apiRoot = apiRoot;
       if (proxy?.trim()) {
