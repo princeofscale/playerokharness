@@ -61,6 +61,11 @@ const EVENT_TYPE_TO_CORDIS: Record<EventTypes, keyof import('cordis').Events> = 
   [EventTypes.ITEM_SENT]: 'playerok/item-sent',
 };
 
+const SERIAL_EVENTS = new Set<keyof import('cordis').Events>([
+  'playerok/new-deal',
+  'playerok/item-paid',
+]);
+
 export class PlayerokService extends Service {
   static provide = 'playerok';
   static inject = ['storage'];
@@ -259,18 +264,26 @@ export class PlayerokService extends Service {
     const cordisEvent = EVENT_TYPE_TO_CORDIS[event.type];
     if (!cordisEvent) return;
     const hooks = [...(this.ctx.events._hooks[cordisEvent] ?? [])];
-    await Promise.all(
-      hooks.map(async (hook) => {
-        if (hook.removed) return;
-        try {
-          await hook.callback(event);
-        } catch (err) {
-          this.log.error(
-            `Ошибка в обработчике события ${String(cordisEvent)}: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-      }),
-    );
+
+    const runHook = async (hook: (typeof hooks)[number]) => {
+      if (hook.removed) return;
+      try {
+        await hook.callback(event);
+      } catch (err) {
+        this.log.error(
+          `Ошибка в обработчике события ${String(cordisEvent)}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    };
+
+    if (SERIAL_EVENTS.has(cordisEvent)) {
+      for (const hook of hooks) {
+        await runHook(hook);
+      }
+      return;
+    }
+
+    await Promise.all(hooks.map(runHook));
   }
 
   public isSupportOrSystemChat(chatId: string): boolean {

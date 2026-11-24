@@ -28,17 +28,29 @@ export interface PlayerokCoreEvents {
   'update/available'(release: GitHubRelease): void | Promise<void>;
 
   // PlayerOK events (1:1 with EventTypes)
+  /** @mode parallel */
   'playerok/chat-initialized'(event: ChatInitializedEvent): void | Promise<void>;
+  /** @mode parallel */
   'playerok/new-message'(event: NewMessageEvent): void | Promise<void>;
+  /** @mode serial — runs sequentially (cache -> blacklist -> messages -> delivery -> auto-complete -> notifications) */
   'playerok/new-deal'(event: DealEvent): void | Promise<void>;
+  /** @mode parallel */
   'playerok/new-review'(event: DealEvent): void | Promise<void>;
+  /** @mode parallel */
   'playerok/deal-confirmed'(event: DealEvent): void | Promise<void>;
+  /** @mode parallel */
   'playerok/deal-confirmed-automatically'(event: DealEvent): void | Promise<void>;
+  /** @mode parallel */
   'playerok/deal-rolled-back'(event: DealEvent): void | Promise<void>;
+  /** @mode parallel */
   'playerok/deal-has-problem'(event: DealEvent): void | Promise<void>;
+  /** @mode parallel */
   'playerok/deal-problem-resolved'(event: DealEvent): void | Promise<void>;
+  /** @mode parallel */
   'playerok/deal-status-changed'(event: DealEvent): void | Promise<void>;
+  /** @mode serial — runs sequentially to keep stock/restore operations deterministic */
   'playerok/item-paid'(event: DealEvent): void | Promise<void>;
+  /** @mode parallel */
   'playerok/item-sent'(event: DealEvent): void | Promise<void>;
 
   // Cross-plugin notifications & automation hooks

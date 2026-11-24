@@ -357,4 +357,53 @@ describe('Reliability, idempotency, concurrency & security hardening', () => {
 
     await ctx.fiber.dispose();
   });
+
+  it('dispatches playerok/new-deal strictly serially so delivery always completes before auto-complete SENT', async () => {
+    const dir = makeTempDir();
+    const mock = new MockPlayerokTransport();
+    const order: string[] = [];
+
+    const origSend = mock.sendMessage.bind(mock);
+    mock.sendMessage = async (params) => {
+      if (params.text?.includes('ORDERED-KEY')) {
+        await new Promise((r) => setTimeout(r, 25));
+        order.push('delivered');
+      }
+      return origSend(params);
+    };
+    const origUpdateDeal = mock.updateDeal.bind(mock);
+    mock.updateDeal = async (dealId, status) => {
+      order.push(`deal:${status}`);
+      return origUpdateDeal(dealId, status);
+    };
+
+    const app = await createApplication({
+      dataDir: dir,
+      dryRun: true,
+      transport: mock,
+      enableTelegram: false,
+      enableTimers: false,
+      enableInstanceLock: false,
+      silentConsole: true,
+    });
+
+    app.ctx.storage.updateConfig((cfg) => {
+      cfg.playerok.auto_complete_deals.enabled = true;
+      cfg.playerok.auto_complete_deals.all = true;
+    });
+    app.ctx.storage.set('auto_deliveries', [
+      { keyphrases: ['Steam Key'], piece: true, goods: ['ORDERED-KEY'] },
+    ]);
+
+    await app.start();
+    await mock.simulateNewDeal({
+      dealId: 'deal-serial-order',
+      buyer: { id: 'b-serial', username: 'SerialBuyer' },
+      chatId: 'chat-serial',
+      itemId: '11111111-1111-1111-1111-111111111111',
+    });
+
+    expect(order).toEqual(['delivered', 'deal:SENT']);
+    await app.stop();
+  });
 });
