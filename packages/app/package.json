@@ -1,0 +1,21 @@
+{
+  "name": "@playerok/app",
+  "version": "2.0.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "playerok": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@playerok/core": "workspace:*",
+    "@playerok/adapter": "workspace:*",
+    "@playerok/plugin-automation": "workspace:*",
+    "@playerok/plugin-telegram": "workspace:*",
+    "cordis": "4.0.0-rc.13"
+  }
+}

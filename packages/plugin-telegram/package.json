@@ -1,0 +1,25 @@
+{
+  "name": "@playerok/plugin-telegram",
+  "version": "2.0.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@playerok/adapter": "workspace:*",
+    "@playerok/core": "workspace:*",
+    "@playerok/plugin-automation": "workspace:*",
+    "cordis": "4.0.0-rc.13",
+    "grammy": "^1.36.0",
+    "https-proxy-agent": "^9.1.0"
+  }
+}

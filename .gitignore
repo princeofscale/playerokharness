@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.tsbuildinfo
+/logs/
+/bot_settings/
+/bot_data/
+/plugins/
+.env
+*.bak
+.DS_Store
