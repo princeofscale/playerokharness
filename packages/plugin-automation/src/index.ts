@@ -27,22 +27,34 @@ export interface AutomationBundleConfig {
 }
 
 /**
+ * Mounts all standard automation plugins on the GIVEN context.
+ *
+ * Prefer this over a nested bundle when another root-level service (the Telegram
+ * panel, the web dashboard) needs the automation services through `ctx.get()`: a
+ * service provided inside a nested plugin is only reachable by dependants that
+ * list it in `inject`, never by an ancestor context.
+ */
+export function mountAutomation(ctx: Context, config: AutomationBundleConfig = {}): void {
+  const enableTimers = config.enableTimers ?? true;
+
+  ctx.use(ordersCachePlugin);
+  ctx.use(blacklistPlugin);
+  ctx.use(messagesPlugin);
+  ctx.use(autoDeliveryPlugin);
+  ctx.use(autoCompletePlugin);
+  ctx.use(AutoRestoreService, { enableTimer: enableTimers, ...config.restore });
+  ctx.use(AutoBumpService, { enableTimer: enableTimers, ...config.bump });
+  ctx.use(AutoWithdrawalService, { enableTimer: enableTimers, ...config.withdrawal });
+  ctx.use(notificationsPlugin);
+}
+
+/**
  * Mounts all standard PlayerOK Harness automation plugins into a Cordis Context.
  */
 export const automationBundle = {
   name: 'automation-bundle',
   inject: ['storage', 'blacklist', 'playerok'],
   apply(ctx: Context, config: AutomationBundleConfig = {}): void {
-    const enableTimers = config.enableTimers ?? true;
-
-    ctx.use(ordersCachePlugin);
-    ctx.use(blacklistPlugin);
-    ctx.use(messagesPlugin);
-    ctx.use(autoDeliveryPlugin);
-    ctx.use(autoCompletePlugin);
-    ctx.use(AutoRestoreService, { enableTimer: enableTimers, ...config.restore });
-    ctx.use(AutoBumpService, { enableTimer: enableTimers, ...config.bump });
-    ctx.use(AutoWithdrawalService, { enableTimer: enableTimers, ...config.withdrawal });
-    ctx.use(notificationsPlugin);
+    mountAutomation(ctx, config);
   },
 };

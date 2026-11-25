@@ -52,7 +52,7 @@ export const notificationsPlugin = {
         if (event.message.images?.length) {
           parts.push(
             event.message.images
-              .map((img, i) => `<a href="${img.url}">*Изображение ${i + 1}*</a>`)
+              .map((img, i) => `<a href="${escapeHtml(img.url).replace(/"/g, '&quot;')}">*Изображение ${i + 1}*</a>`)
               .join(', '),
           );
         }

@@ -59,3 +59,22 @@
 - [x] **Изоляция прав внешних плагинов (P2)**: capability-ограниченный контекст для недоверенных плагинов (`plugins.trusted`) скрывает секреты и блокирует `autoWithdrawal` / `access` / `lock` / `setConfig`.
 - [x] **Персистентная очередь повторов и Dead-Letter Queue (`@pkh/plugin-retry-queue`)**: экспоненциальный backoff, дедупликация задач, резервирование поштучных ключей при сбое `sendMessage`, fallback для `auto-delivery` / `auto-complete` / `blacklist` / `auto-restore` / `auto-bump`, Telegram-экран управления DLQ и алерты.
 - [x] **Документация**: переработанный `README.md`, `AGENTS.md`, `LICENSE` (MIT).
+
+## Раунд 2 (2026-11-25) — новый функционал
+
+- **@pkh/plugin-web**: read-only дашборд без зависимостей (node:http + SSE): обзор,
+  сделки, очередь повторов/DLQ, хвост логов, /api/*, /events, /healthz; токен через
+  PKH_WEB_TOKEN или --web-token; отказ стартовать на не-loopback адресе без токена.
+  Подключён в createApplication (--web, PKH_WEB_*) с ожиданием готовности сервера.
+- **Контракт-гард PlayerOK**: 13 loose-Zod схем ответов GraphQL/WS, 14 точек проверки,
+  кольцевой буфер ContractIssue (50), PlayerokService.getContractIssues() и watchdog в
+  bootstrap, который пишет в лог появившийся дрейф API.
+- **Retry-queue**: персистентные lease-ы (pending/processing/dead, claimedAt/claimedBy),
+  реклейм просроченной аренды, retention DLQ (14 дней / 500 задач), джиттер ±20 %,
+  валидация статуса в update_deal.
+- **Автоматизация**: поиск проданного товара по id, возврат ключа в сток при отказе
+  очереди, эскалация !продавец в первом сообщении, честная ошибка баланса,
+  экранирование URL в уведомлениях.
+- **Конфиг**: env-оверрайды больше не мутируют объект и не могут попасть в config.json
+  через setConfig(getConfig()).
+- **Тулинг**: pretest собирает workspace, CI делает холодную сборку (pnpm clean).

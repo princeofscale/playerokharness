@@ -224,6 +224,9 @@ importers:
       '@pkh/plugin-telegram':
         specifier: workspace:*
         version: link:../plugin-telegram
+      '@pkh/plugin-web':
+        specifier: workspace:*
+        version: link:../plugin-web
       cordis:
         specifier: 4.0.0-rc.13
         version: 4.0.0-rc.13
@@ -312,6 +315,18 @@ importers:
       https-proxy-agent:
         specifier: ^9.1.0
         version: 9.1.0
+
+  packages/plugin-web:
+    dependencies:
+      '@pkh/adapter':
+        specifier: workspace:*
+        version: link:../playerok
+      '@pkh/core':
+        specifier: workspace:*
+        version: link:../core
+      cordis:
+        specifier: 4.0.0-rc.13
+        version: 4.0.0-rc.13
 
 packages:
 

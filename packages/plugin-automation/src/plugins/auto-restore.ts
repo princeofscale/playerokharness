@@ -52,22 +52,48 @@ export class AutoRestoreService extends Service {
         if (event.deal.user.id === ctx.playerok.account?.id) return;
         if (!ctx.storage.getConfig().playerok.auto_restore_items.sold) return;
 
-        const soldItems = await ctx.playerok.getMyItems({
-          count: 24,
-          statuses: [ItemStatuses.SOLD],
-        });
-        const target = soldItems.find(
-          (it) =>
-            it.id === event.deal.item.id ||
-            (it.name === event.deal.item.name &&
-              (!event.deal.item.priority || it.priority === event.deal.item.priority)),
-        );
+        // A one-page SOLD scan silently stops working once the shop has more than
+        // ~24 sold listings: the just-sold item is simply not on the page. Fetch it
+        // by id first and only fall back to the page scan when the id is unusable.
+        let target: ItemProfile | MyItem | null = null;
+        if (event.deal.item.id) {
+          try {
+            const fetched = await ctx.playerok.getItem({ id: event.deal.item.id });
+            if (!fetched.status || fetched.status === ItemStatuses.SOLD) {
+              target = fetched;
+            } else {
+              this.log.debug(
+                `Товар «${fetched.name}» уже не в статусе SOLD (${String(fetched.status)}) — восстановление не требуется`,
+              );
+            }
+          } catch (err) {
+            this.log.warn(
+              `Не удалось получить проданный товар ${event.deal.item.id}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
+
+        if (!target) {
+          const soldItems = await ctx.playerok.getMyItems({
+            count: 24,
+            statuses: [ItemStatuses.SOLD],
+          });
+          target =
+            soldItems.find(
+              (it) =>
+                it.id === event.deal.item.id ||
+                (it.name === event.deal.item.name &&
+                  (!event.deal.item.priority || it.priority === event.deal.item.priority)),
+            ) ?? null;
+          if (!target) {
+            this.log.warn(
+              `Проданный товар «${event.deal.item.name}» не найден среди последних 24 SOLD — авто-восстановление пропущено`,
+            );
+          }
+        }
+
         if (target) {
           await this.restoreItem(target);
-        } else {
-          this.log.warn(
-            `Проданный товар «${event.deal.item.name}» не найден среди последних 24 SOLD — авто-восстановление пропущено`,
-          );
         }
       } catch (err) {
         this.log.error(

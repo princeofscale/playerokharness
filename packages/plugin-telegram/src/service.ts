@@ -27,6 +27,8 @@ import '@pkh/adapter';
 import '@pkh/plugin-automation';
 import '@pkh/plugin-retry-queue';
 import type { StatsPeriod } from '@pkh/plugin-automation';
+import { PASSWORD_MAX_ATTEMPTS, PASSWORD_WINDOW_MS, PasswordAttemptLimiter } from './auth-rate-limit.js';
+import { CALLBACK_DATA_MAX_BYTES, STALE_CALLBACK_TEXT, fitCallback, readCallbackValue } from './callbacks.js';
 import {
   InputStateStore,
   type BindingBucket,
@@ -79,6 +81,62 @@ import {
 /** Ограничение на размер файла, скачиваемого из Telegram (защита от роста памяти). */
 const MAX_TELEGRAM_FILE_BYTES = 25 * 1024 * 1024;
 
+/**
+ * Every callback `section` the router understands. `noop` is short-circuited by the
+ * callback_query handler and `access` is served by its own composer, so both are routable
+ * even though they never reach handleCallback. The list is the router's guard: a payload
+ * from an older build gets the deterministic "stale button" answer instead of a silent no-op
+ * (and the test suite fails when a render* screen emits a section that is missing here).
+ */
+export const CALLBACK_SECTIONS = [
+  'noop',
+  'access',
+  'menu',
+  'rq',
+  'chats',
+  'deals',
+  'items',
+  'txs',
+  'reviews',
+  'stats',
+  'bind',
+  'bind_del',
+  'deliv',
+  'dr',
+  'withdraw',
+  'toggle',
+  'msg',
+  'cmd',
+  'fr',
+  'bl',
+  'mod',
+  'logs',
+  'auth',
+  'cfg',
+  'chat',
+  'deal',
+  'item',
+  'action',
+  'fsm',
+] as const;
+
+export function isKnownCallbackSection(data: string): boolean {
+  const section = data.split(':', 1)[0] ?? '';
+  return (CALLBACK_SECTIONS as readonly string[]).includes(section);
+}
+
+/**
+ * Builds before the callback registry percent-encoded the command name, so a button already
+ * sitting in a chat history still carries '%21help' instead of '!help'.
+ */
+function decodeLegacyCommandKey(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
 export interface TelegramServiceConfig {
   token?: string;
   customApiUrl?: string;
@@ -90,6 +148,46 @@ export class TelegramService extends Service {
   static provide = 'telegram';
   static inject = ['storage', 'access', 'blacklist', 'plugins'];
 
+  // Cordis 4.0.0-rc.13 only allows `ctx.<service>` when the name is listed in
+  // `static inject`, and every listed inject is a HARD dependency (the fiber stays
+  // PENDING until it is provided). The panel renders optional subsystems, so every
+  // cross-service read goes through the non-strict `ctx.get(name, false)` accessor:
+  // the screen works when the subsystem is mounted and reports a clear message when not.
+  private requireService<K extends keyof Context & string>(name: K): Context[K] {
+    const value = this.ctx.get(name, false) as Context[K] | undefined;
+    if (!value) throw new Error(`Сервис «${name}» не подключён`);
+    return value;
+  }
+
+  private get playerok(): Context['playerok'] {
+    return this.requireService('playerok');
+  }
+
+  private get autoBump(): Context['autoBump'] | undefined {
+    return this.ctx.get('autoBump', false);
+  }
+
+  private get autoRestore(): Context['autoRestore'] | undefined {
+    return this.ctx.get('autoRestore', false);
+  }
+
+  private get autoWithdrawal(): Context['autoWithdrawal'] | undefined {
+    return this.ctx.get('autoWithdrawal', false);
+  }
+
+  private get updater(): Context['updater'] | undefined {
+    return this.ctx.get('updater', false);
+  }
+
+  private get logSink(): Context['logSink'] | undefined {
+    return this.ctx.get('logSink', false);
+  }
+
+  private get bootReport(): Context['bootReport'] | undefined {
+    return this.ctx.get('bootReport', false);
+  }
+
+
   public readonly bot: Bot | null;
   public readonly fsm = new InputStateStore();
   public username: string | null = null;
@@ -99,6 +197,7 @@ export class TelegramService extends Service {
   private readonly floatMessageIds = new Map<number, number>(); // chatId -> last floating menu messageId
   private onSetupLaunch?: () => Promise<SetupProblem | null>;
   private readonly proxyAgent: HttpsProxyAgent<string> | undefined;
+  private readonly passwordLimiter = new PasswordAttemptLimiter();
   private running = false;
 
   constructor(ctx: Context, config: TelegramServiceConfig = {}) {
@@ -222,13 +321,13 @@ export class TelegramService extends Service {
   }
 
   public async sendBootReport(): Promise<void> {
-    if (!this.bot || !this.ctx.bootReport) return;
-    const marker = this.ctx.bootReport.popMarker();
-    const errors = this.ctx.bootReport.getErrors();
-    const notes = this.ctx.bootReport.getNotes();
+    if (!this.bot || !this.bootReport) return;
+    const marker = this.bootReport.popMarker();
+    const errors = this.bootReport.getErrors();
+    const notes = this.bootReport.getNotes();
     if (!marker && errors.length === 0 && notes.length === 0) return;
 
-    const html = this.ctx.bootReport.formatReportHtml(marker, this.ctx.plugins.list());
+    const html = this.bootReport.formatReportHtml(marker, this.ctx.plugins.list());
     const targets = new Set<number | string>(this.ctx.access.getSignedUsers());
     if (marker?.chat_id) targets.add(marker.chat_id);
 
@@ -294,8 +393,8 @@ export class TelegramService extends Service {
     const owners = this.ctx.access.getSignedUsers();
     const text = `💬 <b>Вызов продавца!</b>\n\nПокупатель <b>${escapeHtml(payload.username)}</b> просит подключиться к <a href="https://playerok.com/chats/${payload.chatId}">чату</a>.`;
     const kb = new InlineKeyboard()
-      .text('✏️ Ответить', `chat:reply:${payload.chatId}`)
-      .text('💬 Открыть чат', `chat:view:${payload.chatId}`);
+      .text('✏️ Ответить', fitCallback('chat:reply', payload.chatId))
+      .text('💬 Открыть чат', fitCallback('chat:view', payload.chatId));
 
     for (const userId of owners) {
       await this.bot.api
@@ -418,10 +517,10 @@ export class TelegramService extends Service {
         const code = arg.slice(OWNER_PREFIX.length);
         if (this.ctx.access.claimOwner(userId, code)) {
           await gctx.reply('✅ Вы успешно привязаны как владелец бота!');
-          const problem = this.ctx.playerok?.setupProblem ?? null;
+          const problem = this.playerok?.setupProblem ?? null;
           await this.showView(
             gctx,
-            problem ? renderSetupMode(problem) : renderMainMenu(Boolean(this.ctx.playerok?.isDryRun), null),
+            problem ? renderSetupMode(problem) : renderMainMenu(Boolean(this.playerok?.isDryRun), null),
             false,
           );
           return;
@@ -433,10 +532,10 @@ export class TelegramService extends Service {
         return;
       }
 
-      const problem = this.ctx.playerok?.setupProblem ?? null;
+      const problem = this.playerok?.setupProblem ?? null;
       await this.showView(
         gctx,
-        problem ? renderSetupMode(problem) : renderMainMenu(Boolean(this.ctx.playerok?.isDryRun), null),
+        problem ? renderSetupMode(problem) : renderMainMenu(Boolean(this.playerok?.isDryRun), null),
         false,
       );
     });
@@ -444,7 +543,7 @@ export class TelegramService extends Service {
     bot.command('status', async (gctx) => {
       const userId = gctx.from?.id;
       if (!userId || !this.ctx.access.isSigned(userId)) return;
-      const acc = this.ctx.playerok?.account;
+      const acc = this.playerok?.account;
       const plugins = this.ctx.plugins.list();
       const activePlugins = plugins.filter((p) => p.enabled).length;
       const rqStats = this.ctx.get('retryQueue', false)?.getStats();
@@ -452,7 +551,7 @@ export class TelegramService extends Service {
         '<b>📊 Статус PlayerOK Harness</b>',
         '',
         `Аккаунт: <b>${escapeHtml(acc?.username ?? 'не подключен')}</b>`,
-        `Режим: <b>${this.ctx.playerok?.setupProblem ? 'SETUP MODE' : this.ctx.playerok?.isDryRun ? 'DRY-RUN' : 'LIVE'}</b>`,
+        `Режим: <b>${this.playerok?.setupProblem ? 'SETUP MODE' : this.playerok?.isDryRun ? 'DRY-RUN' : 'LIVE'}</b>`,
         `Плагинов активно: <b>${activePlugins}/${plugins.length}</b>`,
         ...(rqStats ? [`Очередь повторов: <b>${rqStats.pending}</b> pending / <b>${rqStats.dead}</b> DLQ`] : []),
         `Uptime: <b>${Math.floor(process.uptime())}с</b>`,
@@ -464,7 +563,7 @@ export class TelegramService extends Service {
       const userId = gctx.from?.id;
       if (!userId || !this.ctx.access.isSigned(userId)) return;
       const sent = await gctx.reply('🔄️ <b>Перезагружаю бота</b>, подождите...', { parse_mode: 'HTML' });
-      this.ctx.bootReport?.setMarker('restart', sent.chat.id, sent.message_id);
+      this.bootReport?.setMarker('restart', sent.chat.id, sent.message_id);
       await this.ctx.parallel('bot/shutdown');
     });
 
@@ -479,7 +578,8 @@ export class TelegramService extends Service {
           return;
         }
         this.ctx.access.rememberRequest(userId, gctx.from?.username, gctx.from?.first_name);
-        await gctx.answerCallbackQuery({ text: 'Заявка отправлена владельцу' });
+        // The request is stored already: a failed ack must not skip the owner notification below.
+        await gctx.answerCallbackQuery({ text: 'Заявка отправлена владельцу' }).catch(() => {});
         const owners = this.ctx.access.getSignedUsers();
         const kb = new InlineKeyboard()
           .text('✅ Одобрить', `access:approve:${userId}`)
@@ -514,7 +614,8 @@ export class TelegramService extends Service {
           parse_mode: 'HTML',
         });
       }
-      await gctx.answerCallbackQuery();
+      // Access was already granted/revoked above: a failed ack must not surface as an error.
+      await gctx.answerCallbackQuery().catch(() => {});
     });
 
     bot.on('callback_query:data', async (gctx) => {
@@ -532,10 +633,12 @@ export class TelegramService extends Service {
       try {
         await this.handleCallback(gctx, userId, data);
       } catch (err) {
-        await gctx.answerCallbackQuery({
-          text: `Ошибка: ${err instanceof Error ? err.message.slice(0, 120) : 'неизвестная'}`,
-          show_alert: true,
-        });
+        await gctx
+          .answerCallbackQuery({
+            text: `Ошибка: ${err instanceof Error ? err.message.slice(0, 120) : 'неизвестная'}`,
+            show_alert: true,
+          })
+          .catch(() => {});
       }
     });
 
@@ -550,7 +653,7 @@ export class TelegramService extends Service {
       const largest = gctx.message.photo[gctx.message.photo.length - 1];
       try {
         const buffer = await this.downloadTelegramFile(largest.file_id);
-        const sent = await this.ctx.playerok.sendMessage(pending.chatId, gctx.message.caption || null, {
+        const sent = await this.playerok.sendMessage(pending.chatId, gctx.message.caption || null, {
           images: [{ filename: 'photo.jpg', data: buffer, contentType: 'image/jpeg' }],
         });
         await gctx.reply(sent ? '✅ Изображение отправлено в чат PlayerOK.' : '❌ Не удалось отправить изображение.');
@@ -621,16 +724,35 @@ export class TelegramService extends Service {
       }
 
       if (pending.kind === 'auth_password') {
+        // The legacy password is one shared secret and AccessService does not lock users out,
+        // so the brute-force budget is enforced here, before the password is even compared.
+        if (this.passwordLimiter.isBlocked(userId)) {
+          const minutes = Math.max(1, Math.ceil(this.passwordLimiter.retryAfterSec(userId) / 60));
+          this.log.warn(
+            `Лимит попыток ввода пароля исчерпан: user ${userId} (${PASSWORD_MAX_ATTEMPTS} за ${PASSWORD_WINDOW_MS / 60_000} мин)`,
+          );
+          await gctx.reply(`⛔ Слишком много неверных попыток ввода пароля. Повторите через ~${minutes} мин.`);
+          return;
+        }
+
         if (this.ctx.access.verifyPasswordLogin(userId, text)) {
+          this.passwordLimiter.reset(userId);
           this.fsm.clear(userId);
           await gctx.reply('✅ Пароль принят! Вы авторизованы.');
           await this.showView(
             gctx,
-            renderMainMenu(Boolean(this.ctx.playerok?.isDryRun), this.ctx.playerok?.setupProblem ?? null),
+            renderMainMenu(Boolean(this.playerok?.isDryRun), this.playerok?.setupProblem ?? null),
             false,
           );
         } else {
-          await gctx.reply('❌ Неверный пароль. Попробуйте снова или /cancel');
+          const failures = this.passwordLimiter.recordFailure(userId);
+          const left = this.passwordLimiter.remainingAttempts(userId);
+          this.log.warn(`Неверный пароль администратора: user ${userId}, попытка ${failures}/${PASSWORD_MAX_ATTEMPTS}`);
+          await gctx.reply(
+            left > 0
+              ? `❌ Неверный пароль. Осталось попыток: ${left}. Или /cancel`
+              : `⛔ Слишком много неверных попыток. Повторите через ~${PASSWORD_WINDOW_MS / 60_000} мин.`,
+          );
         }
         return;
       }
@@ -658,7 +780,48 @@ export class TelegramService extends Service {
     await gctx.reply('🔒 У вас нет доступа к панели управления этим ботом.', { reply_markup: kb });
   }
 
+  /**
+   * Resolves one dynamic callback segment. Keyboards emit a readable literal while the value
+   * fits the byte budget and only fall back to a stored token for long values, so this accepts
+   * both forms. A token the registry no longer knows (restart, evicted entry) answers with the
+   * deterministic "stale button" message instead of throwing or silently doing nothing.
+   */
+  private async resolveCallbackValue(
+    gctx: GrammyContext,
+    prefix: string,
+    key: string | undefined,
+  ): Promise<string | null> {
+    if (key === undefined || key === '') {
+      await gctx.answerCallbackQuery({ text: STALE_CALLBACK_TEXT, show_alert: true }).catch(() => {});
+      return null;
+    }
+    const value = readCallbackValue(prefix, key);
+    if (value !== null) return value;
+    this.log.warn(`Кнопка устарела: ${prefix}:${key}`);
+    await gctx.answerCallbackQuery({ text: STALE_CALLBACK_TEXT, show_alert: true }).catch(() => {});
+    return null;
+  }
+
+  /**
+   * Rebuilds a two-field callback value emitted by keyboards.ts ('<id>:<number>').
+   * Short values arrive as two separate segments, long ones as one stored token.
+   */
+  private async resolveCallbackPair(
+    gctx: GrammyContext,
+    prefix: string,
+    first: string | undefined,
+    second: string | undefined,
+  ): Promise<string | null> {
+    if (first !== undefined && second !== undefined) return first + ':' + second;
+    return this.resolveCallbackValue(gctx, prefix, first);
+  }
+
   private async handleCallback(gctx: GrammyContext, userId: number, data: string): Promise<void> {
+    if (!isKnownCallbackSection(data)) {
+      this.log.warn(`Неизвестный callback_data: ${data.slice(0, CALLBACK_DATA_MAX_BYTES)}`);
+      await gctx.answerCallbackQuery({ text: STALE_CALLBACK_TEXT, show_alert: true }).catch(() => {});
+      return;
+    }
     const parts = data.split(':');
     const [section, arg1, arg2, arg3, arg4] = parts;
     const storage = this.ctx.storage;
@@ -669,14 +832,14 @@ export class TelegramService extends Service {
         case 'main':
           return this.showView(
             gctx,
-            renderMainMenu(Boolean(this.ctx.playerok?.isDryRun), this.ctx.playerok?.setupProblem ?? null),
+            renderMainMenu(Boolean(this.playerok?.isDryRun), this.playerok?.setupProblem ?? null),
           );
         case 'setup':
           return this.showView(
             gctx,
-            this.ctx.playerok?.setupProblem
-              ? renderSetupMode(this.ctx.playerok.setupProblem)
-              : renderMainMenu(Boolean(this.ctx.playerok?.isDryRun), null),
+            this.playerok?.setupProblem
+              ? renderSetupMode(this.playerok.setupProblem)
+              : renderMainMenu(Boolean(this.playerok?.isDryRun), null),
           );
         case 'notifications':
           return this.showView(gctx, renderNotificationsSettings(storage.getConfig()));
@@ -687,19 +850,19 @@ export class TelegramService extends Service {
         case 'bump':
           return this.showView(
             gctx,
-            renderBumpSettings(storage.getConfig(), Array.from(this.ctx.autoBump?.itemPositions.values() ?? [])),
+            renderBumpSettings(storage.getConfig(), Array.from(this.autoBump?.itemPositions.values() ?? [])),
           );
         case 'bump_positions':
           return this.showView(
             gctx,
-            renderBumpPositions(Array.from(this.ctx.autoBump?.itemPositions.values() ?? [])),
+            renderBumpPositions(Array.from(this.autoBump?.itemPositions.values() ?? [])),
           );
         case 'withdrawal':
           return this.showView(gctx, renderWithdrawalSettings(storage.getConfig()));
         case 'other':
           return this.showView(gctx, renderOtherSettings(storage.getConfig()));
         case 'conn':
-          return this.showView(gctx, renderConnectionSettings(storage.getConfig(), Boolean(this.ctx.playerok?.isDryRun)));
+          return this.showView(gctx, renderConnectionSettings(storage.getConfig(), Boolean(this.playerok?.isDryRun)));
         case 'messages':
           return this.showView(gctx, renderMessagesList(storage.getMessages()));
         case 'commands':
@@ -707,11 +870,11 @@ export class TelegramService extends Service {
         case 'fast_replies':
           return this.showView(gctx, renderFastRepliesList(storage.getFastReplies()));
         case 'profile':
-          return this.showView(gctx, renderProfile(this.ctx.playerok?.account ?? null));
+          return this.showView(gctx, renderProfile(this.playerok?.account ?? null));
         case 'modules':
           return this.showView(gctx, renderModulesList(this.ctx.plugins.list()));
         case 'logs':
-          return this.showView(gctx, renderLogs(this.ctx.logSink?.getRecentLines(40) ?? []));
+          return this.showView(gctx, renderLogs(this.logSink?.getRecentLines(40) ?? []));
         case 'retry_queue':
           return this.showView(gctx, renderRetryQueue(this.ctx.get('retryQueue', false)?.list() ?? []));
         case 'signed_users':
@@ -723,12 +886,15 @@ export class TelegramService extends Service {
             gctx,
             renderUpdatesMenu(
               storage.getConfig(),
-              this.ctx.updater?.latestRelease ?? null,
-              Boolean(this.ctx.updater?.hasNewerRelease()),
+              this.updater?.latestRelease ?? null,
+              Boolean(this.updater?.hasNewerRelease()),
             ),
           );
+        default:
+          this.log.warn(`Неизвестный раздел меню: ${arg1 ?? '—'}`);
+          await gctx.answerCallbackQuery({ text: STALE_CALLBACK_TEXT, show_alert: true }).catch(() => {});
+          return;
       }
-      return;
     }
 
     if (section === 'rq') {
@@ -739,45 +905,59 @@ export class TelegramService extends Service {
       }
       if (arg1 === 'run') {
         const res = await rq.processDue();
-        await gctx.answerCallbackQuery({
-          text: `Выполнено: ${res.succeeded}, отложено: ${res.rescheduled}, DLQ: ${res.deadLettered}`,
-          show_alert: true,
-        });
+        // Answering after the queue was mutated must not abort the re-render when Telegram
+        // rejects the (possibly already answered) callback query.
+        await gctx
+          .answerCallbackQuery({
+            text: `Выполнено: ${res.succeeded}, отложено: ${res.rescheduled}, DLQ: ${res.deadLettered}`,
+            show_alert: true,
+          })
+          .catch(() => {});
         return this.showView(gctx, renderRetryQueue(rq.list()));
       }
       if (arg1 === 'retry_dead') {
         const moved = await rq.retryAllDead();
         const res = moved > 0 ? await rq.processDue() : { succeeded: 0, rescheduled: 0, deadLettered: 0 };
-        await gctx.answerCallbackQuery({
-          text:
-            moved > 0
-              ? `Возвращено из DLQ: ${moved} (выполнено: ${res.succeeded})`
-              : 'Dead-Letter Queue пуста',
-          show_alert: true,
-        });
+        await gctx
+          .answerCallbackQuery({
+            text:
+              moved > 0
+                ? `Возвращено из DLQ: ${moved} (выполнено: ${res.succeeded})`
+                : 'Dead-Letter Queue пуста',
+            show_alert: true,
+          })
+          .catch(() => {});
         return this.showView(gctx, renderRetryQueue(rq.list()));
       }
       if (arg1 === 'clear_dead') {
         const cleared = await rq.clearDead();
-        await gctx.answerCallbackQuery({ text: `Удалено из DLQ: ${cleared}` });
+        await gctx.answerCallbackQuery({ text: `Удалено из DLQ: ${cleared}` }).catch(() => {});
         return this.showView(gctx, renderRetryQueue(rq.list()));
       }
-      if (arg1 === 'retry' && arg2) {
-        const ok = await rq.retryDeadTask(arg2);
+      if (arg1 === 'retry') {
+        const taskId = await this.resolveCallbackValue(gctx, 'rq:retry', arg2);
+        if (!taskId) return;
+        const ok = await rq.retryDeadTask(taskId);
         if (ok) {
           const res = await rq.processDue();
-          await gctx.answerCallbackQuery({
-            text: res.succeeded > 0 ? `Задача #${arg2} выполнена` : `Задача #${arg2} возвращена в очередь`,
-            show_alert: true,
-          });
+          await gctx
+            .answerCallbackQuery({
+              text: res.succeeded > 0 ? `Задача #${taskId} выполнена` : `Задача #${taskId} возвращена в очередь`,
+              show_alert: true,
+            })
+            .catch(() => {});
         } else {
-          await gctx.answerCallbackQuery({ text: 'Задача не найдена', show_alert: true });
+          await gctx.answerCallbackQuery({ text: 'Задача не найдена', show_alert: true }).catch(() => {});
         }
         return this.showView(gctx, renderRetryQueue(rq.list()));
       }
-      if (arg1 === 'del' && arg2) {
-        const removed = await rq.removeTask(arg2);
-        await gctx.answerCallbackQuery({ text: removed ? `Задача #${arg2} удалена` : 'Задача не найдена' });
+      if (arg1 === 'del') {
+        const taskId = await this.resolveCallbackValue(gctx, 'rq:del', arg2);
+        if (!taskId) return;
+        const removed = await rq.removeTask(taskId);
+        await gctx
+          .answerCallbackQuery({ text: removed ? `Задача #${taskId} удалена` : 'Задача не найдена' })
+          .catch(() => {});
         return this.showView(gctx, renderRetryQueue(rq.list()));
       }
       return;
@@ -786,8 +966,8 @@ export class TelegramService extends Service {
     if (section === 'chats' && arg1 === 'page') {
       await gctx.answerCallbackQuery();
       const page = Number(arg2) || 0;
-      const list = this.ctx.playerok?.account ? (await this.ctx.playerok.getChats(48)).items : [];
-      return this.showView(gctx, renderChatsList(list, this.ctx.playerok?.account?.id, page));
+      const list = this.playerok?.account ? (await this.playerok.getChats(48)).items : [];
+      return this.showView(gctx, renderChatsList(list, this.playerok?.account?.id, page));
     }
 
     if (section === 'deals') {
@@ -795,7 +975,7 @@ export class TelegramService extends Service {
       const filter = arg1 || 'ALL';
       const page = Number(arg2) || 0;
       const statuses = filter === 'ALL' ? undefined : [filter as ItemDealStatuses];
-      const list = this.ctx.playerok?.account ? (await this.ctx.playerok.getDeals({ statuses, count: 48 })).items : [];
+      const list = this.playerok?.account ? (await this.playerok.getDeals({ statuses, count: 48 })).items : [];
       return this.showView(gctx, renderDealsList(list, filter, page));
     }
 
@@ -803,8 +983,8 @@ export class TelegramService extends Service {
       await gctx.answerCallbackQuery();
       const filter = (arg1 || ItemStatuses.APPROVED) as ItemStatuses;
       const page = Number(arg2) || 0;
-      const list = this.ctx.playerok?.account
-        ? await this.ctx.playerok.getMyItems({ statuses: [filter], count: 48 })
+      const list = this.playerok?.account
+        ? await this.playerok.getMyItems({ statuses: [filter], count: 48 })
         : [];
       return this.showView(gctx, renderItemsList(list, filter, page));
     }
@@ -812,7 +992,7 @@ export class TelegramService extends Service {
     if (section === 'txs' && arg1 === 'page') {
       await gctx.answerCallbackQuery();
       const page = Number(arg2) || 0;
-      const list = this.ctx.playerok?.account ? (await this.ctx.playerok.getTransactions(48)).items : [];
+      const list = this.playerok?.account ? (await this.playerok.getTransactions(48)).items : [];
       return this.showView(gctx, renderTransactionsList(list, page));
     }
 
@@ -820,8 +1000,8 @@ export class TelegramService extends Service {
       await gctx.answerCallbackQuery();
       const rating = Number(arg1) || 0;
       const page = Number(arg2) || 0;
-      const list = this.ctx.playerok?.account
-        ? (await this.ctx.playerok.getReviews({ count: 48, rating: rating || null })).items
+      const list = this.playerok?.account
+        ? (await this.playerok.getReviews({ count: 48, rating: rating || null })).items
         : [];
       return this.showView(gctx, renderReviewsList(list, rating, page));
     }
@@ -849,7 +1029,7 @@ export class TelegramService extends Service {
       const updated = storage.update<IncludeExcludeSettings>(store, (obj) => {
         if (idx >= 0 && idx < obj[bucket].length) obj[bucket].splice(idx, 1);
       });
-      await gctx.answerCallbackQuery({ text: 'Привязка удалена' });
+      await gctx.answerCallbackQuery({ text: 'Привязка удалена' }).catch(() => {});
       return this.showView(gctx, renderBindingsList(store, bucket, updated[bucket], page));
     }
 
@@ -871,21 +1051,21 @@ export class TelegramService extends Service {
             if (list[idx].piece && !list[idx].goods) list[idx].goods = [];
           }
         });
-        await gctx.answerCallbackQuery();
+        await gctx.answerCallbackQuery().catch(() => {});
         if (updated[idx]) return this.showView(gctx, renderDeliveryDetail(idx, updated[idx]));
       }
       if (arg1 === 'clear_goods') {
         const updated = storage.update<AutoDeliveryRule[]>('auto_deliveries', (list) => {
           if (list[idx]) list[idx].goods = [];
         });
-        await gctx.answerCallbackQuery({ text: 'Поштучные товары очищены' });
+        await gctx.answerCallbackQuery({ text: 'Поштучные товары очищены' }).catch(() => {});
         if (updated[idx]) return this.showView(gctx, renderDeliveryDetail(idx, updated[idx]));
       }
       if (arg1 === 'del') {
         const updated = storage.update<AutoDeliveryRule[]>('auto_deliveries', (list) => {
           if (idx >= 0 && idx < list.length) list.splice(idx, 1);
         });
-        await gctx.answerCallbackQuery({ text: 'Правило удалено' });
+        await gctx.answerCallbackQuery({ text: 'Правило удалено' }).catch(() => {});
         return this.showView(gctx, renderDeliveriesList(updated, 0));
       }
       return;
@@ -906,21 +1086,21 @@ export class TelegramService extends Service {
         const updated = storage.update<DataReplacementRule[]>('data_replacement', (list) => {
           if (list[idx]) list[idx].enabled = !list[idx].enabled;
         });
-        await gctx.answerCallbackQuery();
+        await gctx.answerCallbackQuery().catch(() => {});
         if (updated[idx]) return this.showView(gctx, renderDataReplacementDetail(idx, updated[idx]));
       }
       if (arg1 === 'clear') {
         const updated = storage.update<DataReplacementRule[]>('data_replacement', (list) => {
           if (list[idx]) list[idx].data = [];
         });
-        await gctx.answerCallbackQuery({ text: 'Строки очищены' });
+        await gctx.answerCallbackQuery({ text: 'Строки очищены' }).catch(() => {});
         if (updated[idx]) return this.showView(gctx, renderDataReplacementDetail(idx, updated[idx]));
       }
       if (arg1 === 'del') {
         const updated = storage.update<DataReplacementRule[]>('data_replacement', (list) => {
           if (idx >= 0 && idx < list.length) list.splice(idx, 1);
         });
-        await gctx.answerCallbackQuery({ text: 'Правило удалено' });
+        await gctx.answerCallbackQuery({ text: 'Правило удалено' }).catch(() => {});
         return this.showView(gctx, renderDataReplacementList(updated, 0));
       }
       return;
@@ -929,25 +1109,30 @@ export class TelegramService extends Service {
     if (section === 'withdraw') {
       if (arg1 === 'cards') {
         await gctx.answerCallbackQuery();
-        const cards = this.ctx.playerok?.account ? await this.ctx.playerok.getVerifiedCards() : [];
+        const cards = this.playerok?.account ? await this.playerok.getVerifiedCards() : [];
         return this.showView(gctx, renderWithdrawalCards(cards));
       }
       if (arg1 === 'set_card') {
+        const cardId = await this.resolveCallbackValue(gctx, 'withdraw:set_card', arg2);
+        if (!cardId) return;
         const cfg = storage.updateConfig((c) => {
           c.playerok.auto_withdrawal.credentials_type = 'card';
-          c.playerok.auto_withdrawal.card_id = arg2;
+          c.playerok.auto_withdrawal.card_id = cardId;
         });
-        await gctx.answerCallbackQuery({ text: 'Карта выбрана для авто-вывода' });
+        await gctx.answerCallbackQuery({ text: 'Карта выбрана для авто-вывода' }).catch(() => {});
         return this.showView(gctx, renderWithdrawalSettings(cfg));
       }
       if (arg1 === 'sbp') {
         await gctx.answerCallbackQuery();
-        const banks = this.ctx.playerok?.account ? await this.ctx.playerok.getSbpBankMembers() : [];
+        const banks = this.playerok?.account ? await this.playerok.getSbpBankMembers() : [];
         return this.showView(gctx, renderWithdrawalSbpBanks(banks));
       }
       if (arg1 === 'set_sbp') {
-        this.fsm.set(userId, { kind: 'edit_withdrawal_sbp_phone', bankId: arg2 });
-        await gctx.answerCallbackQuery();
+        const bankId = await this.resolveCallbackValue(gctx, 'withdraw:set_sbp', arg2);
+        if (!bankId) return;
+        this.fsm.set(userId, { kind: 'edit_withdrawal_sbp_phone', bankId });
+        // The FSM state is set: a failed ack must not swallow the prompt that explains it.
+        await gctx.answerCallbackQuery().catch(() => {});
         await gctx.reply('📱 Введите номер телефона для СБП (например +79991234567) или /cancel:');
         return;
       }
@@ -994,7 +1179,7 @@ export class TelegramService extends Service {
         });
         return this.showView(
           gctx,
-          renderBumpSettings(cfg, Array.from(this.ctx.autoBump?.itemPositions.values() ?? [])),
+          renderBumpSettings(cfg, Array.from(this.autoBump?.itemPositions.values() ?? [])),
         );
       }
       if (arg1 === 'withdrawal') {
@@ -1018,7 +1203,7 @@ export class TelegramService extends Service {
         });
         return this.showView(
           gctx,
-          renderUpdatesMenu(cfg, this.ctx.updater?.latestRelease ?? null, Boolean(this.ctx.updater?.hasNewerRelease())),
+          renderUpdatesMenu(cfg, this.updater?.latestRelease ?? null, Boolean(this.updater?.hasNewerRelease())),
         );
       }
     }
@@ -1038,11 +1223,15 @@ export class TelegramService extends Service {
     }
 
     if (section === 'cmd' && arg1 === 'del') {
-      const key = decodeURIComponent(arg2);
+      const stored = await this.resolveCallbackValue(gctx, 'cmd:del', arg2);
+      if (!stored) return;
+      const existing = storage.getCustomCommands();
+      // A stored token decodes to the raw name; a literal may still be the legacy encoded form.
+      const key = Object.hasOwn(existing, stored) ? stored : decodeLegacyCommandKey(stored);
       const updated = storage.update<CustomCommandsSettings>('custom_commands', (c) => {
         delete c[key];
       });
-      await gctx.answerCallbackQuery({ text: `Команда ${key} удалена` });
+      await gctx.answerCallbackQuery({ text: `Команда ${key} удалена` }).catch(() => {});
       return this.showView(gctx, renderCommandsList(updated));
     }
 
@@ -1051,7 +1240,7 @@ export class TelegramService extends Service {
       const updated = storage.update<FastReply[]>('fast_replies', (list) => {
         if (idx >= 0 && idx < list.length) list.splice(idx, 1);
       });
-      await gctx.answerCallbackQuery({ text: 'Быстрый ответ удалён' });
+      await gctx.answerCallbackQuery({ text: 'Быстрый ответ удалён' }).catch(() => {});
       return this.showView(gctx, renderFastRepliesList(updated));
     }
 
@@ -1061,34 +1250,45 @@ export class TelegramService extends Service {
         return this.showView(gctx, renderBlacklist(this.ctx.blacklist.list(), Number(arg2) || 0));
       }
       if (arg1 === 'del') {
-        const username = decodeURIComponent(arg2);
+        const stored = await this.resolveCallbackPair(gctx, 'bl:del', arg2, arg3);
+        if (!stored) return;
+        const sep = stored.lastIndexOf(':');
+        const username = sep === -1 ? stored : stored.slice(0, sep);
+        const page = sep === -1 ? 0 : Number(stored.slice(sep + 1)) || 0;
+        if (!username) {
+          await gctx.answerCallbackQuery({ text: STALE_CALLBACK_TEXT, show_alert: true }).catch(() => {});
+          return;
+        }
         this.ctx.blacklist.remove(username);
-        await gctx.answerCallbackQuery({ text: `${username} убран из ЧС` });
-        return this.showView(gctx, renderBlacklist(this.ctx.blacklist.list(), Number(arg3) || 0));
+        await gctx.answerCallbackQuery({ text: `${username} убран из ЧС` }).catch(() => {});
+        return this.showView(gctx, renderBlacklist(this.ctx.blacklist.list(), page));
       }
     }
 
     if (section === 'mod') {
-      const id = decodeURIComponent(arg2);
       if (arg1 === 'toggle') {
+        const id = await this.resolveCallbackValue(gctx, 'mod:toggle', arg2);
+        if (!id) return;
         const rec = this.ctx.plugins.get(id);
         if (rec) {
           if (rec.enabled) await this.ctx.plugins.disable(id);
           else await this.ctx.plugins.enable(id);
         }
-        await gctx.answerCallbackQuery();
+        await gctx.answerCallbackQuery().catch(() => {});
         return this.showView(gctx, renderModulesList(this.ctx.plugins.list()));
       }
       if (arg1 === 'del') {
+        const id = await this.resolveCallbackValue(gctx, 'mod:del', arg2);
+        if (!id) return;
         await this.ctx.plugins.removePlugin(id);
-        await gctx.answerCallbackQuery({ text: `Плагин ${id} удалён` });
+        await gctx.answerCallbackQuery({ text: `Плагин ${id} удалён` }).catch(() => {});
         return this.showView(gctx, renderModulesList(this.ctx.plugins.list()));
       }
     }
 
     if (section === 'logs' && arg1 === 'clear') {
-      this.ctx.logSink?.clearLogs();
-      await gctx.answerCallbackQuery({ text: 'Логи очищены' });
+      this.logSink?.clearLogs();
+      await gctx.answerCallbackQuery({ text: 'Логи очищены' }).catch(() => {});
       return this.showView(gctx, renderLogs([]));
     }
 
@@ -1099,7 +1299,7 @@ export class TelegramService extends Service {
         return;
       }
       this.ctx.access.removeSignedUser(targetId);
-      await gctx.answerCallbackQuery({ text: `Доступ ${targetId} отозван` });
+      await gctx.answerCallbackQuery({ text: `Доступ ${targetId} отозван` }).catch(() => {});
       return this.showView(gctx, renderSignedUsers(this.ctx.access.getSignedUsers()));
     }
 
@@ -1115,25 +1315,40 @@ export class TelegramService extends Service {
 
     if (section === 'chat') {
       if (arg1 === 'view') {
+        const chatId = await this.resolveCallbackValue(gctx, 'chat:view', arg2);
+        if (!chatId) return;
         await gctx.answerCallbackQuery();
-        const chat = await this.ctx.playerok.getChat(arg2, false);
-        const msgs = await this.ctx.playerok.getChatMessages(arg2, 12);
+        const chat = await this.playerok.getChat(chatId, false);
+        const msgs = await this.playerok.getChatMessages(chatId, 12);
         return this.showView(
           gctx,
-          renderChatDetail(chat, msgs, storage.getFastReplies(), this.ctx.playerok.account?.id),
+          renderChatDetail(chat, msgs, storage.getFastReplies(), this.playerok.account?.id),
         );
       }
       if (arg1 === 'reply') {
-        this.fsm.set(userId, { kind: 'reply_chat', chatId: arg2 });
-        await gctx.answerCallbackQuery();
+        const chatId = await this.resolveCallbackValue(gctx, 'chat:reply', arg2);
+        if (!chatId) return;
+        this.fsm.set(userId, { kind: 'reply_chat', chatId });
+        // The FSM state is set: a failed ack must not swallow the prompt that explains it.
+        await gctx.answerCallbackQuery().catch(() => {});
         await gctx.reply('✏️ Отправьте текст или фото для отправки в чат (или /cancel):');
         return;
       }
       if (arg1 === 'fr') {
-        const reply = storage.getFastReplies()[Number(arg3)];
+        const stored = await this.resolveCallbackPair(gctx, 'chat:fr', arg2, arg3);
+        if (!stored) return;
+        const sep = stored.lastIndexOf(':');
+        const chatId = sep === -1 ? '' : stored.slice(0, sep);
+        const index = sep === -1 ? -1 : Number(stored.slice(sep + 1));
+        if (!chatId || !Number.isInteger(index) || index < 0) {
+          await gctx.answerCallbackQuery({ text: STALE_CALLBACK_TEXT, show_alert: true }).catch(() => {});
+          return;
+        }
+        const reply = storage.getFastReplies()[index];
         if (reply) {
-          await this.ctx.playerok.sendMessage(arg2, reply.text.join('\n'));
-          await gctx.answerCallbackQuery({ text: `Отправлено: ${reply.name}` });
+          // The message reached PlayerOK already — a failed ack must not abort the handler.
+          await this.playerok.sendMessage(chatId, reply.text.join('\n'));
+          await gctx.answerCallbackQuery({ text: `Отправлено: ${reply.name}` }).catch(() => {});
         } else {
           await gctx.answerCallbackQuery({ text: 'Быстрый ответ не найден' });
         }
@@ -1143,38 +1358,56 @@ export class TelegramService extends Service {
 
     if (section === 'deal') {
       if (arg1 === 'view') {
+        const dealId = await this.resolveCallbackValue(gctx, 'deal:view', arg2);
+        if (!dealId) return;
         await gctx.answerCallbackQuery();
-        const deal = await this.ctx.playerok.getDeal(arg2);
+        const deal = await this.playerok.getDeal(dealId);
         return this.showView(gctx, renderDealDetail(deal));
       }
       if (arg1 === 'confirm') {
-        const deal = await this.ctx.playerok.updateDeal(arg2, ItemDealStatuses.SENT);
-        await gctx.answerCallbackQuery({ text: 'Сделка отмечена как отправленная' });
+        const dealId = await this.resolveCallbackValue(gctx, 'deal:confirm', arg2);
+        if (!dealId) return;
+        const deal = await this.playerok.updateDeal(dealId, ItemDealStatuses.SENT);
+        // The status change already happened: a rejected answerCallbackQuery must not
+        // abort the re-render and leave the panel showing the stale status.
+        await gctx.answerCallbackQuery({ text: 'Сделка отмечена как отправленная' }).catch(() => {});
         return this.showView(gctx, renderDealDetail(deal));
       }
       if (arg1 === 'refund') {
-        const deal = await this.ctx.playerok.updateDeal(arg2, ItemDealStatuses.ROLLED_BACK);
-        await gctx.answerCallbackQuery({ text: 'Оформлен возврат по сделке' });
+        const dealId = await this.resolveCallbackValue(gctx, 'deal:refund', arg2);
+        if (!dealId) return;
+        const deal = await this.playerok.updateDeal(dealId, ItemDealStatuses.ROLLED_BACK);
+        await gctx.answerCallbackQuery({ text: 'Оформлен возврат по сделке' }).catch(() => {});
         return this.showView(gctx, renderDealDetail(deal));
       }
     }
 
     if (section === 'item') {
       if (arg1 === 'view') {
+        const itemId = await this.resolveCallbackValue(gctx, 'item:view', arg2);
+        if (!itemId) return;
         await gctx.answerCallbackQuery();
-        const item = await this.ctx.playerok.getItem({ id: arg2 });
+        const item = await this.playerok.getItem({ id: itemId });
         return this.showView(gctx, renderItemDetail(item));
       }
       if (arg1 === 'bump') {
-        const item = await this.ctx.playerok.getItem({ id: arg2 });
-        const ok = await this.ctx.autoBump?.bumpItem(item, 'вручную из Telegram');
-        await gctx.answerCallbackQuery({ text: ok ? 'Товар поднят!' : 'Товар не подошёл под правила или ошибка' });
+        const itemId = await this.resolveCallbackValue(gctx, 'item:bump', arg2);
+        if (!itemId) return;
+        const item = await this.playerok.getItem({ id: itemId });
+        const ok = await this.autoBump?.bumpItem(item, 'вручную из Telegram');
+        await gctx
+          .answerCallbackQuery({ text: ok ? 'Товар поднят!' : 'Товар не подошёл под правила или ошибка' })
+          .catch(() => {});
         return;
       }
       if (arg1 === 'restore') {
-        const item = await this.ctx.playerok.getItem({ id: arg2 });
-        const ok = await this.ctx.autoRestore?.restoreItem(item);
-        await gctx.answerCallbackQuery({ text: ok ? 'Товар восстановлен!' : 'Не удалось восстановить' });
+        const itemId = await this.resolveCallbackValue(gctx, 'item:restore', arg2);
+        if (!itemId) return;
+        const item = await this.playerok.getItem({ id: itemId });
+        const ok = await this.autoRestore?.restoreItem(item);
+        await gctx
+          .answerCallbackQuery({ text: ok ? 'Товар восстановлен!' : 'Не удалось восстановить' })
+          .catch(() => {});
         return;
       }
     }
@@ -1184,52 +1417,58 @@ export class TelegramService extends Service {
         await gctx.answerCallbackQuery({ text: 'Проверяю подключение к PlayerOK...' });
         const problem = this.onSetupLaunch
           ? await this.onSetupLaunch()
-          : await this.ctx.playerok.diagnose();
+          : await this.playerok.diagnose();
         if (problem) {
           return this.showView(gctx, renderSetupMode(problem));
         }
-        return this.showView(gctx, renderMainMenu(Boolean(this.ctx.playerok?.isDryRun), null));
+        return this.showView(gctx, renderMainMenu(Boolean(this.playerok?.isDryRun), null));
       }
       if (arg1 === 'refresh_profile') {
-        await this.ctx.playerok?.refreshAccount();
-        await gctx.answerCallbackQuery({ text: 'Профиль обновлён' });
-        return this.showView(gctx, renderProfile(this.ctx.playerok?.account ?? null));
+        await this.playerok?.refreshAccount();
+        await gctx.answerCallbackQuery({ text: 'Профиль обновлён' }).catch(() => {});
+        return this.showView(gctx, renderProfile(this.playerok?.account ?? null));
       }
       if (arg1 === 'bump_now') {
-        const res = await this.ctx.autoBump?.bumpItems();
-        await gctx.answerCallbackQuery({ text: `Поднято: ${res?.bumped ?? 0}/${res?.total ?? 0}` });
+        const res = await this.autoBump?.bumpItems();
+        await gctx
+          .answerCallbackQuery({ text: `Поднято: ${res?.bumped ?? 0}/${res?.total ?? 0}` })
+          .catch(() => {});
         return;
       }
       if (arg1 === 'check_positions') {
-        const res = await this.ctx.autoBump?.checkItemsPositions();
-        await gctx.answerCallbackQuery({ text: `Проверено: ${res?.total ?? 0}, поднято: ${res?.bumped ?? 0}` });
+        const res = await this.autoBump?.checkItemsPositions();
+        await gctx
+          .answerCallbackQuery({ text: `Проверено: ${res?.total ?? 0}, поднято: ${res?.bumped ?? 0}` })
+          .catch(() => {});
         return this.showView(
           gctx,
-          renderBumpPositions(Array.from(this.ctx.autoBump?.itemPositions.values() ?? [])),
+          renderBumpPositions(Array.from(this.autoBump?.itemPositions.values() ?? [])),
         );
       }
       if (arg1 === 'restore_expired') {
-        const count = (await this.ctx.autoRestore?.restoreExpiredItems()) ?? 0;
-        await gctx.answerCallbackQuery({ text: `Восстановлено истёкших: ${count}` });
+        const count = (await this.autoRestore?.restoreExpiredItems()) ?? 0;
+        await gctx.answerCallbackQuery({ text: `Восстановлено истёкших: ${count}` }).catch(() => {});
         return;
       }
       if (arg1 === 'withdraw_now') {
-        const res = await this.ctx.autoWithdrawal?.requestWithdrawal();
-        await gctx.answerCallbackQuery({
-          text: res?.ok ? `Создана заявка на ${res.amount}₽` : `Ошибка: ${res?.error ?? 'неизвестно'}`,
-          show_alert: true,
-        });
+        const res = await this.autoWithdrawal?.requestWithdrawal();
+        await gctx
+          .answerCallbackQuery({
+            text: res?.ok ? `Создана заявка на ${res.amount}₽` : `Ошибка: ${res?.error ?? 'неизвестно'}`,
+            show_alert: true,
+          })
+          .catch(() => {});
         return;
       }
       if (arg1 === 'check_updates') {
-        await this.ctx.updater?.getReleases(true).catch(() => {});
-        await gctx.answerCallbackQuery({ text: 'Релизы проверены' });
+        await this.updater?.getReleases(true).catch(() => {});
+        await gctx.answerCallbackQuery({ text: 'Релизы проверены' }).catch(() => {});
         return this.showView(
           gctx,
           renderUpdatesMenu(
             storage.getConfig(),
-            this.ctx.updater?.latestRelease ?? null,
-            Boolean(this.ctx.updater?.hasNewerRelease()),
+            this.updater?.latestRelease ?? null,
+            Boolean(this.updater?.hasNewerRelease()),
           ),
         );
       }
@@ -1353,15 +1592,18 @@ export class TelegramService extends Service {
       }
     }
 
-    await gctx.answerCallbackQuery();
+    // Known section, but no branch matched this action: report it instead of leaving the
+    // user with a spinner and no feedback.
+    this.log.warn(`Необработанный callback_data: ${data.slice(0, CALLBACK_DATA_MAX_BYTES)}`);
+    await gctx.answerCallbackQuery({ text: STALE_CALLBACK_TEXT, show_alert: true }).catch(() => {});
   }
 
   private async resolveBindingFromInput(raw: string): Promise<{ items?: BoundItem[]; keyphrases?: string[] }> {
     const trimmed = raw.trim();
-    if (this.ctx.playerok?.account && (trimmed.includes('playerok.com') || /^[0-9a-f-]{36}$/i.test(trimmed))) {
+    if (this.playerok?.account && (trimmed.includes('playerok.com') || /^[0-9a-f-]{36}$/i.test(trimmed))) {
       try {
         const ref = parseItemRef(trimmed);
-        const item = await this.ctx.playerok.getItem({ [ref.kind]: ref.value });
+        const item = await this.playerok.getItem({ [ref.kind]: ref.value });
         return { items: [{ id: item.id, slug: item.slug, name: item.name }] };
       } catch {
         // Fallback to keyphrase if lookup fails
@@ -1381,7 +1623,7 @@ export class TelegramService extends Service {
 
     switch (pending.kind) {
       case 'reply_chat': {
-        const sent = await this.ctx.playerok.sendMessage(pending.chatId, text);
+        const sent = await this.playerok.sendMessage(pending.chatId, text);
         await gctx.reply(sent ? '✅ Сообщение отправлено в чат.' : '❌ Не удалось отправить сообщение.');
         return;
       }
@@ -1529,7 +1771,7 @@ export class TelegramService extends Service {
         });
         await this.showView(
           gctx,
-          renderBumpSettings(cfg, Array.from(this.ctx.autoBump?.itemPositions.values() ?? [])),
+          renderBumpSettings(cfg, Array.from(this.autoBump?.itemPositions.values() ?? [])),
           false,
         );
         return;
@@ -1545,7 +1787,7 @@ export class TelegramService extends Service {
         });
         await this.showView(
           gctx,
-          renderBumpSettings(cfg, Array.from(this.ctx.autoBump?.itemPositions.values() ?? [])),
+          renderBumpSettings(cfg, Array.from(this.autoBump?.itemPositions.values() ?? [])),
           false,
         );
         return;
@@ -1594,12 +1836,12 @@ export class TelegramService extends Service {
           else if (pending.field === 'tg_password') c.telegram.bot.password = val;
         });
         if (pending.field.startsWith('pl_')) {
-          await this.ctx.playerok?.reconfigureTransport();
+          await this.playerok?.reconfigureTransport();
         }
         if (pending.field === 'notif_chat_id') {
           await this.showView(gctx, renderNotificationsSettings(cfg), false);
         } else {
-          await this.showView(gctx, renderConnectionSettings(cfg, Boolean(this.ctx.playerok?.isDryRun)), false);
+          await this.showView(gctx, renderConnectionSettings(cfg, Boolean(this.playerok?.isDryRun)), false);
         }
         return;
       }

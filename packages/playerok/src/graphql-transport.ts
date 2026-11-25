@@ -15,10 +15,14 @@ import {
   TransactionProviderIds,
   TransactionStatuses,
   parseCookieString,
+  z,
   type AccountInfo,
   type Chat,
   type ChatMessage,
+  type ChatStatuses,
+  type DataField,
   type ItemDeal,
+  type ItemDealDirections,
   type ItemPriorityStatus,
   type ItemProfile,
   type MyItem,
@@ -28,6 +32,7 @@ import {
   type SbpBankMember,
   type Transaction,
   type UserProfile,
+  type UserTypes,
   type VerifiedCard,
 } from '@pkh/core';
 import {
@@ -36,6 +41,30 @@ import {
   UnauthorizedError,
 } from './errors.js';
 import { GQL_QUERIES, PERSISTED_QUERIES } from './queries.js';
+import {
+  chatMessagesPayloadSchema,
+  chatPayloadSchema,
+  chatsPayloadSchema,
+  dealPayloadSchema,
+  dealsPayloadSchema,
+  itemPayloadSchema,
+  itemPriorityStatusesPayloadSchema,
+  itemsPayloadSchema,
+  reviewsPayloadSchema,
+  transactionsPayloadSchema,
+  userPayloadSchema,
+  viewerPayloadSchema,
+  wsNextPayloadSchema,
+  type ChatMessageNode,
+  type ChatNode,
+  type ContractIssue,
+  type DealNode,
+  type EmbeddedDealNode,
+  type ItemNode,
+  type ProfileNode,
+  type TransactionNode,
+  type UserNode,
+} from './schemas.js';
 import type {
   BinaryUpload,
   CreateItemParams,
@@ -71,6 +100,10 @@ const CHALLENGE_SIGNATURES = [
 ];
 
 const MAX_CLAIMED_IDS = 3000;
+/** Response-contract issues kept in the transport ring buffer. */
+export const MAX_CONTRACT_ISSUES = 50;
+/** Zod issue paths recorded per drifted payload. */
+const MAX_CONTRACT_ISSUE_PATHS = 5;
 const CATCH_UP_MAX_AGE_MS = 10 * 60 * 1000;
 /**
  * Last messages younger than this stay unclaimed on the initial chat fetch so that
@@ -84,11 +117,11 @@ function normalizeProxyUrl(proxy?: string): string | null {
   return /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
 }
 
-function mapUser(u: any): UserProfile {
+function mapUser(u: UserNode | null | undefined): UserProfile {
   return {
     id: String(u?.id ?? ''),
     username: String(u?.username ?? ''),
-    role: u?.role ?? null,
+    role: (u?.role ?? null) as UserTypes | null,
     avatarUrl: u?.avatarURL ?? null,
     isOnline: Boolean(u?.isOnline),
     isBlocked: Boolean(u?.isBlocked),
@@ -100,24 +133,24 @@ function mapUser(u: any): UserProfile {
   };
 }
 
-function mapChat(c: any): Chat {
+function mapChat(c: ChatNode | null | undefined): Chat {
   const rawUsers = c?.participants ?? c?.users ?? [];
   return {
     id: String(c?.id ?? ''),
     type: (c?.type as ChatTypes) ?? ChatTypes.PM,
-    status: c?.status ?? null,
+    status: (c?.status ?? null) as ChatStatuses | null,
     unreadMessagesCounter: c?.unreadMessagesCounter ?? 0,
     users: Array.isArray(rawUsers) ? rawUsers.map(mapUser) : [],
     lastMessage: c?.lastMessage ? mapMessage(c.lastMessage) : null,
   };
 }
 
-function mapDeal(d: any): ItemDeal {
+function mapDeal(d: DealNode | EmbeddedDealNode | null | undefined): ItemDeal {
   const reviewRaw = d?.testimonial ?? d?.review;
   return {
     id: String(d?.id ?? ''),
     status: (d?.status as ItemDealStatuses) ?? ItemDealStatuses.PAID,
-    direction: d?.direction,
+    direction: d?.direction as ItemDealDirections | undefined,
     createdAt: d?.createdAt ?? null,
     completedAt: d?.completedAt ?? null,
     hasProblem: Boolean(d?.hasProblem),
@@ -128,7 +161,7 @@ function mapDeal(d: any): ItemDeal {
     review: reviewRaw
       ? {
           id: String(reviewRaw.id ?? ''),
-          status: reviewRaw.status ?? null,
+          status: (reviewRaw.status ?? null) as ReviewStatuses | null,
           rating: Number(reviewRaw.rating ?? 5),
           text: reviewRaw.text ?? null,
           createdAt: String(reviewRaw.createdAt ?? new Date().toISOString()),
@@ -139,7 +172,7 @@ function mapDeal(d: any): ItemDeal {
   };
 }
 
-function mapItem(it: any): MyItem {
+function mapItem(it: ItemNode | null | undefined): MyItem {
   return {
     id: String(it?.id ?? ''),
     slug: String(it?.slug ?? ''),
@@ -155,12 +188,12 @@ function mapItem(it: any): MyItem {
     category: it?.category ? { id: String(it.category.id), name: it.category.name, slug: it.category.slug } : null,
     obtainingType: it?.obtainingType ? { id: String(it.obtainingType.id), name: it.obtainingType.name } : null,
     attributes: it?.attributes ?? {},
-    dataFields: Array.isArray(it?.dataFields) ? it.dataFields : [],
+    dataFields: Array.isArray(it?.dataFields) ? (it.dataFields as DataField[]) : [],
     attachments: Array.isArray(it?.attachments) ? it.attachments : [],
   };
 }
 
-function mapMessage(m: any): ChatMessage {
+function mapMessage(m: ChatMessageNode | null | undefined): ChatMessage {
   return {
     id: String(m?.id ?? ''),
     text: m?.text ?? null,
@@ -172,12 +205,12 @@ function mapMessage(m: any): ChatMessage {
   };
 }
 
-function mapTransaction(t: any): Transaction {
+function mapTransaction(t: TransactionNode | null | undefined): Transaction {
   return {
     id: String(t?.id ?? ''),
     operation: (t?.operation as TransactionOperations) ?? TransactionOperations.SELL,
     direction: (t?.direction as TransactionDirections) ?? TransactionDirections.IN,
-    providerId: t?.providerId ?? null,
+    providerId: (t?.providerId ?? null) as TransactionProviderIds | null,
     status: (t?.status as TransactionStatuses) ?? TransactionStatuses.PENDING,
     value: Number(t?.value ?? 0),
     fee: t?.fee ?? undefined,
@@ -229,6 +262,7 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
   private readonly claimedMessageIds = new Set<string>();
   private readonly processedDealIds = new Set<string>();
   private readonly reviewCheckDeals = new Map<string, { lastCheck: number; tries: number }>();
+  private readonly contractIssues: ContractIssue[] = [];
 
   constructor(options: GraphQLTransportOptions) {
     this.baseUrl = (options.baseUrl ?? 'https://playerok.com').replace(/\/+$/, '');
@@ -315,6 +349,42 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
   }
 
   /**
+   * Validates a raw GraphQL/WS payload against the response contract.
+   *
+   * On drift it records a bounded issue (operation + first Zod issue paths) and
+   * returns the raw payload cast to the schema type. Mapping therefore stays
+   * best-effort exactly as before - the guard only makes the drift observable
+   * instead of letting a renamed field silently become `undefined`/`''`/`0`.
+   */
+  private guard<T>(op: string, schema: z.ZodType<T>, data: unknown): T {
+    const parsed = schema.safeParse(data);
+    if (!parsed.success) {
+      this.recordContractIssue({
+        op,
+        paths: parsed.error.issues.slice(0, MAX_CONTRACT_ISSUE_PATHS).map((issue) =>
+          issue.path.length > 0 ? issue.path.map((segment) => String(segment)).join('.') : '(root)',
+        ),
+        issueCount: parsed.error.issues.length,
+        at: new Date().toISOString(),
+      });
+    }
+    return data as T;
+  }
+
+  /** Appends to the bounded ring buffer (oldest issue dropped first). */
+  private recordContractIssue(issue: ContractIssue): void {
+    this.contractIssues.push(issue);
+    while (this.contractIssues.length > MAX_CONTRACT_ISSUES) {
+      this.contractIssues.shift();
+    }
+  }
+
+  /** Recent response-contract issues observed at the GraphQL/WS boundary. */
+  public getContractIssues(): ContractIssue[] {
+    return this.contractIssues.slice();
+  }
+
+  /**
    * Executes a persisted GET GraphQL query matching PlayerOK's Apollo APQ protocol.
    */
   private async persistedQuery<T>(
@@ -394,27 +464,35 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
   }
 
   public async getAccount(): Promise<AccountInfo> {
-    const viewerData = await this.postQuery<{ viewer: any }>('viewer', GQL_QUERIES.viewer, {});
+    const viewerData = this.guard(
+      'viewer',
+      viewerPayloadSchema,
+      await this.postQuery<unknown>('viewer', GQL_QUERIES.viewer, {}),
+    );
     const v = viewerData.viewer;
     if (!v) {
       throw new UnauthorizedError('viewer вернул null — проверьте cookies');
     }
     this.accountId = String(v.id);
 
-    let fullUser: any = null;
+    let fullUser: UserNode | null = null;
     try {
-      const userData = await this.persistedQuery<{ user: any }>('user', {
-        username: v.username,
-        hasSupportAccess: false,
-      });
+      const userData = this.guard(
+        'user',
+        userPayloadSchema,
+        await this.persistedQuery<unknown>('user', {
+          username: v.username,
+          hasSupportAccess: false,
+        }),
+      );
       fullUser = userData.user;
     } catch {
       // Fallback to viewer-only fields if persisted user query fails
     }
 
-    const profileRaw = fullUser?.profile ?? v.profile ?? {};
+    const profileRaw: ProfileNode = fullUser?.profile ?? v.profile ?? {};
     const balanceRaw = fullUser?.balance ?? v.balance ?? null;
-    const statsRaw = fullUser?.stats ?? profileRaw?.stats ?? null;
+    const statsRaw = fullUser?.stats ?? profileRaw.stats ?? null;
 
     return {
       id: String(v.id),
@@ -454,23 +532,36 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
   }
 
   public async getUser(userId: string): Promise<UserProfile> {
-    const data = await this.persistedQuery<{ user: any }>('user', {
-      id: userId,
-      username: null,
-      hasSupportAccess: false,
-    });
-    const raw = data.user?.__typename === 'User' ? { ...data.user, ...data.user.profile } : data.user;
-    return mapUser(raw);
+    const data = this.guard(
+      'user',
+      userPayloadSchema,
+      await this.persistedQuery<unknown>('user', {
+        id: userId,
+        username: null,
+        hasSupportAccess: false,
+      }),
+    );
+    const raw =
+      data.user?.__typename === 'User'
+        ? { ...data.user, ...(data.user.profile ?? {}) }
+        : data.user;
+    // The profile spread may shadow `id` with its nullable twin; runtime ids are
+    // identical, and `mapUser` coerces whatever survives with `String()`.
+    return mapUser(raw as UserNode | null | undefined);
   }
 
   public async getChats(count = 24, afterCursor?: string | null): Promise<PaginatedList<Chat>> {
-    const data = await this.persistedQuery<{ chats: any }>('userChats', {
-      pagination: { first: count, after: afterCursor ?? null },
-      filter: { userId: this.accountId, type: null, status: null },
-      hasSupportAccess: false,
-    });
+    const data = this.guard(
+      'userChats',
+      chatsPayloadSchema,
+      await this.persistedQuery<unknown>('userChats', {
+        pagination: { first: count, after: afterCursor ?? null },
+        filter: { userId: this.accountId, type: null, status: null },
+        hasSupportAccess: false,
+      }),
+    );
     return {
-      items: (data.chats?.edges ?? []).map((e: any) => mapChat(e.node)),
+      items: (data.chats?.edges ?? []).map((e) => mapChat(e.node)),
       pageInfo: {
         endCursor: data.chats?.pageInfo?.endCursor ?? null,
         hasNextPage: Boolean(data.chats?.pageInfo?.hasNextPage),
@@ -479,21 +570,29 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
   }
 
   public async getChat(chatId: string): Promise<Chat> {
-    const data = await this.persistedQuery<{ chat: any }>('chat', {
-      id: chatId,
-      hasSupportAccess: false,
-    });
+    const data = this.guard(
+      'chat',
+      chatPayloadSchema,
+      await this.persistedQuery<unknown>('chat', {
+        id: chatId,
+        hasSupportAccess: false,
+      }),
+    );
     return mapChat(data.chat);
   }
 
   public async getChatMessages(chatId: string, count = 24): Promise<ChatMessage[]> {
-    const data = await this.persistedQuery<{ chatMessages: any }>('chatMessages', {
-      pagination: { first: count, after: null },
-      filter: { chatId },
-      hasSupportAccess: false,
-      showForbiddenImage: true,
-    });
-    return (data.chatMessages?.edges ?? []).map((e: any) => mapMessage(e.node));
+    const data = this.guard(
+      'chatMessages',
+      chatMessagesPayloadSchema,
+      await this.persistedQuery<unknown>('chatMessages', {
+        pagination: { first: count, after: null },
+        filter: { chatId },
+        hasSupportAccess: false,
+        showForbiddenImage: true,
+      }),
+    );
+    return (data.chatMessages?.edges ?? []).map((e) => mapMessage(e.node));
   }
 
   public async markChatAsRead(chatId: string): Promise<void> {
@@ -563,13 +662,17 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
     else if (params.categoryId) filter.gameCategoryId = params.categoryId;
     if (params.obtainingTypeId) filter.obtainingTypeId = params.obtainingTypeId;
 
-    const data = await this.persistedQuery<{ items: any }>('items', {
-      pagination: { first: params.count ?? 24, after: params.afterCursor ?? null },
-      filter,
-      showForbiddenImage: true,
-    });
+    const data = this.guard(
+      'items',
+      itemsPayloadSchema,
+      await this.persistedQuery<unknown>('items', {
+        pagination: { first: params.count ?? 24, after: params.afterCursor ?? null },
+        filter,
+        showForbiddenImage: true,
+      }),
+    );
     return {
-      items: (data.items?.edges ?? []).map((e: any) => mapItem(e.node)),
+      items: (data.items?.edges ?? []).map((e) => mapItem(e.node)),
       pageInfo: {
         endCursor: data.items?.pageInfo?.endCursor ?? null,
         hasNextPage: Boolean(data.items?.pageInfo?.hasNextPage),
@@ -578,20 +681,28 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
   }
 
   public async getItem(ref: { id?: string; slug?: string }): Promise<MyItem> {
-    const data = await this.persistedQuery<{ item: any }>('item', {
-      id: ref.id ?? null,
-      slug: ref.slug ?? null,
-      hasSupportAccess: false,
-      showForbiddenImage: true,
-    });
+    const data = this.guard(
+      'item',
+      itemPayloadSchema,
+      await this.persistedQuery<unknown>('item', {
+        id: ref.id ?? null,
+        slug: ref.slug ?? null,
+        hasSupportAccess: false,
+        showForbiddenImage: true,
+      }),
+    );
     return mapItem(data.item);
   }
 
   public async getItemPriorityStatuses(itemId: string, rawPrice: number): Promise<ItemPriorityStatus[]> {
-    const data = await this.persistedQuery<{ itemPriorityStatuses: any[] }>('itemPriorityStatuses', {
-      itemId,
-      price: Math.trunc(rawPrice),
-    });
+    const data = this.guard(
+      'itemPriorityStatuses',
+      itemPriorityStatusesPayloadSchema,
+      await this.persistedQuery<unknown>('itemPriorityStatuses', {
+        itemId,
+        price: Math.trunc(rawPrice),
+      }),
+    );
     return (data.itemPriorityStatuses ?? []).map((st) => ({
       id: String(st.id),
       name: String(st.name ?? ''),
@@ -679,17 +790,21 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
   }
 
   public async getDeals(params: GetDealsParams = {}): Promise<PaginatedList<ItemDeal>> {
-    const data = await this.persistedQuery<{ deals: any }>('deals', {
-      pagination: { first: params.count ?? 24, after: params.afterCursor ?? null },
-      filter: {
-        userId: this.accountId,
-        direction: params.direction ?? null,
-        status: params.statuses && params.statuses.length > 0 ? params.statuses : null,
-      },
-      showForbiddenImage: true,
-    });
+    const data = this.guard(
+      'deals',
+      dealsPayloadSchema,
+      await this.persistedQuery<unknown>('deals', {
+        pagination: { first: params.count ?? 24, after: params.afterCursor ?? null },
+        filter: {
+          userId: this.accountId,
+          direction: params.direction ?? null,
+          status: params.statuses && params.statuses.length > 0 ? params.statuses : null,
+        },
+        showForbiddenImage: true,
+      }),
+    );
     return {
-      items: (data.deals?.edges ?? []).map((e: any) => mapDeal(e.node)),
+      items: (data.deals?.edges ?? []).map((e) => mapDeal(e.node)),
       pageInfo: {
         endCursor: data.deals?.pageInfo?.endCursor ?? null,
         hasNextPage: Boolean(data.deals?.pageInfo?.hasNextPage),
@@ -698,11 +813,15 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
   }
 
   public async getDeal(dealId: string): Promise<ItemDeal> {
-    const data = await this.persistedQuery<{ deal: any }>('deal', {
-      id: dealId,
-      hasSupportAccess: false,
-      showForbiddenImage: true,
-    });
+    const data = this.guard(
+      'deal',
+      dealPayloadSchema,
+      await this.persistedQuery<unknown>('deal', {
+        id: dealId,
+        hasSupportAccess: false,
+        showForbiddenImage: true,
+      }),
+    );
     return mapDeal(data.deal);
   }
 
@@ -732,19 +851,23 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
     };
     if (params.rating) filter.rating = params.rating;
 
-    const data = await this.persistedQuery<{ testimonials: any }>('testimonials', {
-      pagination: { first: params.count ?? 24, after: params.afterCursor ?? null },
-      filter,
-      sort: { direction: SortDirections.DESC, field: 'createdAt' },
-      hasSupportAccess: false,
-    });
+    const data = this.guard(
+      'testimonials',
+      reviewsPayloadSchema,
+      await this.persistedQuery<unknown>('testimonials', {
+        pagination: { first: params.count ?? 24, after: params.afterCursor ?? null },
+        filter,
+        sort: { direction: SortDirections.DESC, field: 'createdAt' },
+        hasSupportAccess: false,
+      }),
+    );
     return {
-      items: (data.testimonials?.edges ?? []).map((e: any) => ({
+      items: (data.testimonials?.edges ?? []).map((e) => ({
         id: String(e.node.id),
         rating: Number(e.node.rating ?? 5),
         text: e.node.text ?? null,
         createdAt: String(e.node.createdAt ?? new Date().toISOString()),
-        status: e.node.status ?? null,
+        status: (e.node.status ?? null) as ReviewStatuses | null,
         creator: mapUser(e.node.creator),
       })),
       pageInfo: {
@@ -755,12 +878,16 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
   }
 
   public async getTransactions(count = 24, afterCursor?: string | null): Promise<PaginatedList<Transaction>> {
-    const data = await this.persistedQuery<{ transactions: any }>('transactions', {
-      pagination: { first: count, after: afterCursor ?? null },
-      filter: { userId: this.accountId },
-    });
+    const data = this.guard(
+      'transactions',
+      transactionsPayloadSchema,
+      await this.persistedQuery<unknown>('transactions', {
+        pagination: { first: count, after: afterCursor ?? null },
+        filter: { userId: this.accountId },
+      }),
+    );
     return {
-      items: (data.transactions?.edges ?? []).map((e: any) => mapTransaction(e.node)),
+      items: (data.transactions?.edges ?? []).map((e) => mapTransaction(e.node)),
       pageInfo: {
         endCursor: data.transactions?.pageInfo?.endCursor ?? null,
         hasNextPage: Boolean(data.transactions?.pageInfo?.hasNextPage),
@@ -1160,9 +1287,11 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
           }
 
           if (msg.type === 'next' && msg.payload?.data) {
-            const data = msg.payload.data;
+            // Guard the whole WS frame: a renamed subscription key must be reported
+            // rather than silently ignored, and `chatMessageCreated` is validated in full.
+            const data = this.guard('ws:next', wsNextPayloadSchema, msg.payload.data);
 
-            if (data.userUpdated?.unreadChatsCounter > 0) {
+            if ((data.userUpdated?.unreadChatsCounter ?? 0) > 0) {
               void this.pollNewDeals(handler);
             }
 

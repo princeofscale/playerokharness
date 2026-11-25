@@ -1,3 +1,4 @@
+import type { ContractIssue } from './schemas.js';
 import type {
   AccountInfo,
   Chat,
@@ -119,4 +120,11 @@ export interface PlayerokTransport {
 
   subscribe(handler: PlayerokEventHandler): Promise<() => void>;
   close(): Promise<void>;
+
+  /**
+   * Optional response-contract diagnostics: transports that validate raw GraphQL/WS
+   * payloads report recent field drift here. A transport without validation
+   * (e.g. `MockPlayerokTransport`) simply does not implement it.
+   */
+  getContractIssues?(): ContractIssue[];
 }

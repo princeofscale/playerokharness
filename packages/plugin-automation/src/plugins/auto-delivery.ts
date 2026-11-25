@@ -31,6 +31,18 @@ export const autoDeliveryPlugin = {
       return remaining;
     };
 
+    /** Puts a reserved key back when the hand-off to the retry queue failed. */
+    const restorePiece = (index: number, key: string, good: string): void => {
+      ctx.storage.update<AutoDeliveryRule[]>('auto_deliveries', (list) => {
+        const target =
+          list[index] && bindingKey(list[index]) === key
+            ? list[index]
+            : list.find((entry) => bindingKey(entry) === key);
+        if (!target) return;
+        target.goods = [good, ...(target.goods ?? [])];
+      });
+    };
+
     ctx.on('playerok/new-deal', async (event) => {
       try {
         if (event.deal.user.id === ctx.playerok.account?.id) return;
@@ -81,18 +93,27 @@ export const autoDeliveryPlugin = {
                 }
               } else if (retryQueue) {
                 // Reserve the piece item immediately so it is never handed to another buyer while retry is pending
-                anyDelivered = true;
                 if (consumePiece(i, ruleKey, good) === null) {
                   log.warn(
                     `Товар «${good}» зарезервирован под повтор, но не найден в правиле авто-выдачи`,
                   );
                 }
-                await retryQueue.enqueue({
-                  kind: 'send_message',
-                  payload: { chatId: event.chat.id, text: good },
-                  dedupeKey: `delivery:${event.deal.id}:${i}`,
-                  error: sendError ?? 'sendMessage failed during auto-delivery',
-                });
+                try {
+                  await retryQueue.enqueue({
+                    kind: 'send_message',
+                    payload: { chatId: event.chat.id, text: good },
+                    dedupeKey: `delivery:${event.deal.id}:${i}`,
+                    error: sendError ?? 'sendMessage failed during auto-delivery',
+                  });
+                  anyDelivered = true;
+                } catch (enqueueErr) {
+                  // The key was already spliced out of the stock; put it back, otherwise it
+                  // is neither sent nor sellable (silent inventory loss).
+                  restorePiece(i, ruleKey, good);
+                  log.error(
+                    `Не удалось поставить выдачу в очередь повторов: ${enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr)} — товар возвращён в остатки`,
+                  );
+                }
               }
             } else {
               const lines = rule.message ?? [];

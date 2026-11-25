@@ -17,6 +17,7 @@
     "@pkh/plugin-automation": "workspace:*",
     "@pkh/plugin-retry-queue": "workspace:*",
     "@pkh/plugin-telegram": "workspace:*",
+    "@pkh/plugin-web": "workspace:*",
     "cordis": "4.0.0-rc.13"
   }
 }

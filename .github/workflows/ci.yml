@@ -32,6 +32,9 @@ jobs:
       - name: Lint
         run: pnpm lint
 
+      - name: Clean (cold build, no stale tsbuildinfo)
+        run: pnpm clean
+
       - name: Build
         run: pnpm build
 

@@ -58,7 +58,13 @@ export const messagesPlugin = {
           return true;
         });
 
-        if (isNewUser) {
+        const lower = text.toLowerCase();
+        const isEscalation = lower === '!продавец' || lower === '!seller';
+
+        // Greeting used to swallow the buyer's very first message, so a brand-new
+        // buyer whose first message was the documented !продавец command was never
+        // escalated to the seller.
+        if (isNewUser && !isEscalation) {
           const greeting = renderNamedMessage(ctx, 'first_message', {
             user: otherUser,
             chat: event.chat,
@@ -69,8 +75,7 @@ export const messagesPlugin = {
           return;
         }
 
-        const lower = text.toLowerCase();
-        if (lower === '!продавец' || lower === '!seller') {
+        if (isEscalation) {
           await ctx.parallel('notify/call-seller', {
             username: event.message.user.username,
             chatId: event.chat.id,

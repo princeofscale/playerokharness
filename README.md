@@ -113,6 +113,22 @@ pnpm pkh start
 
 > Секреты можно не хранить в `bot_settings/config.json` — используйте переменные окружения из [`.env.example`](./.env.example) (`PKH_TELEGRAM_TOKEN`, `PKH_PLAYEROK_COOKIES` и др.).
 
+### Read-only веб-панель (опционально)
+
+Встроенный HTTP-дашборд без единой внешней зависимости (`node:http` + SSE): статус
+аккаунта, кэш сделок, очередь повторов с DLQ, хвост логов и живой поток событий.
+
+```bash
+# включить (по умолчанию 127.0.0.1:8787, токен из PKH_WEB_TOKEN)
+pnpm pkh start --web --web-port 8787 --web-token "$(openssl rand -hex 24)"
+
+# либо через окружение
+PKH_WEB_ENABLED=true PKH_WEB_TOKEN=secret pnpm pkh start
+```
+
+Откройте `http://127.0.0.1:8787/?token=<токен>` один раз — дальше токен живёт в
+`httpOnly`-cookie. На не-loopback адрес панель **откажется** стартовать без токена.
+
 ### Установка как системный сервис
 
 - **Linux (systemd + глобальная команда `pkh`)**: `sudo ./scripts/install.sh`
@@ -133,7 +149,8 @@ pnpm pkh start
 | `pkh plugins` | Список установленных внешних плагинов |
 | `pkh import-config --from <dir>` | Импорт и Zod-валидация JSON-конфигов из внешнего каталога |
 
-Глобальные флаги: `--data-dir <path>`, `--plugins-dir <path>`, `--no-telegram`, `-h / --help`.
+Глобальные флаги: `--data-dir <path>`, `--plugins-dir <path>`, `--no-telegram`,
+`--web`, `--web-port <port>`, `--web-host <host>`, `--web-token <token>`, `-h / --help`.
 
 ---
 

@@ -145,6 +145,33 @@ export function readJsonSafe<T>(
   return fallback;
 }
 
+/**
+ * A settings screen commonly does `const cfg = getConfig(); ...; setConfig(cfg)`.
+ * getConfig() returns the *effective* config with PKH_* overrides applied, so writing
+ * it back would copy environment secrets into config.json on disk. Any field whose
+ * value still equals the environment override is replaced by the empty string.
+ */
+function stripEnvSecrets(cfg: BotConfig): BotConfig {
+  const env = process.env;
+  const next = structuredClone(cfg);
+  if (env.PKH_TELEGRAM_TOKEN && next.telegram.api.token === env.PKH_TELEGRAM_TOKEN) {
+    next.telegram.api.token = '';
+  }
+  if (env.PKH_PLAYEROK_COOKIES && next.playerok.api.cookies === env.PKH_PLAYEROK_COOKIES) {
+    next.playerok.api.cookies = '';
+  }
+  if (env.PKH_TELEGRAM_PROXY && next.telegram.api.proxy === env.PKH_TELEGRAM_PROXY) {
+    next.telegram.api.proxy = '';
+  }
+  if (env.PKH_PLAYEROK_PROXY && next.playerok.api.proxy === env.PKH_PLAYEROK_PROXY) {
+    next.playerok.api.proxy = '';
+  }
+  if (env.PKH_PLAYEROK_USER_AGENT && next.playerok.api.user_agent === env.PKH_PLAYEROK_USER_AGENT) {
+    next.playerok.api.user_agent = '';
+  }
+  return next;
+}
+
 const IDEMPOTENCY_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const IDEMPOTENCY_MAX_ENTRIES = 5000;
 
@@ -408,7 +435,8 @@ export class StorageService extends Service {
   public set<T>(name: string, value: T): T {
     const spec = this.specs.get(name);
     if (!spec) throw new Error(`Unknown storage key: ${name}`);
-    const parsed = (spec.schema as z.ZodType<T>).parse(value);
+    const safeValue = name === 'config' ? (stripEnvSecrets(value as BotConfig) as unknown as T) : value;
+    const parsed = (spec.schema as z.ZodType<T>).parse(safeValue);
     writeJsonAtomic(this.resolvePath(spec.relativePath), parsed);
     return parsed;
   }
@@ -419,28 +447,47 @@ export class StorageService extends Service {
     return this.set<T>(name, next === undefined ? current : next);
   }
 
-  // Typed convenience accessors (with environment variable secret overrides)
+  // Typed convenience accessors (with environment variable secret overrides).
+  //
+  // The overrides are applied to a *copy*: the previous version mutated the parsed
+  // object, so any caller that handed that object back to setConfig() persisted the
+  // environment secrets into config.json.
   public getConfig(): BotConfig {
-    const cfg = this.get<BotConfig>('config');
-    if (process.env.PKH_TELEGRAM_TOKEN) {
-      cfg.telegram.api.token = process.env.PKH_TELEGRAM_TOKEN;
+    const stored = this.get<BotConfig>('config');
+    const env = process.env;
+    const overrides = {
+      token: env.PKH_TELEGRAM_TOKEN,
+      apiUrl: env.PKH_TELEGRAM_API_URL,
+      tgProxy: env.PKH_TELEGRAM_PROXY,
+      cookies: env.PKH_PLAYEROK_COOKIES,
+      pokeProxy: env.PKH_PLAYEROK_PROXY,
+      userAgent: env.PKH_PLAYEROK_USER_AGENT,
+    };
+    if (Object.values(overrides).every((value) => !value)) {
+      return stored;
     }
-    if (process.env.PKH_TELEGRAM_API_URL) {
-      cfg.telegram.api.custom_api_url = process.env.PKH_TELEGRAM_API_URL;
-    }
-    if (process.env.PKH_TELEGRAM_PROXY) {
-      cfg.telegram.api.proxy = process.env.PKH_TELEGRAM_PROXY;
-    }
-    if (process.env.PKH_PLAYEROK_COOKIES) {
-      cfg.playerok.api.cookies = process.env.PKH_PLAYEROK_COOKIES;
-    }
-    if (process.env.PKH_PLAYEROK_PROXY) {
-      cfg.playerok.api.proxy = process.env.PKH_PLAYEROK_PROXY;
-    }
-    if (process.env.PKH_PLAYEROK_USER_AGENT) {
-      cfg.playerok.api.user_agent = process.env.PKH_PLAYEROK_USER_AGENT;
-    }
-    return cfg;
+
+    return {
+      ...stored,
+      telegram: {
+        ...stored.telegram,
+        api: {
+          ...stored.telegram.api,
+          token: overrides.token || stored.telegram.api.token,
+          custom_api_url: overrides.apiUrl || stored.telegram.api.custom_api_url,
+          proxy: overrides.tgProxy || stored.telegram.api.proxy,
+        },
+      },
+      playerok: {
+        ...stored.playerok,
+        api: {
+          ...stored.playerok.api,
+          cookies: overrides.cookies || stored.playerok.api.cookies,
+          proxy: overrides.pokeProxy || stored.playerok.api.proxy,
+          user_agent: overrides.userAgent || stored.playerok.api.user_agent,
+        },
+      },
+    };
   }
 
   public isDealDelivered(dealId: string): boolean {

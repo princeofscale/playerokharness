@@ -48,7 +48,10 @@ export class AutoWithdrawalService extends Service {
     let balance = 0;
     try {
       const account = await this.ctx.playerok.refreshAccount();
-      balance = account?.profile.balance?.withdrawable ?? 0;
+      if (!account) {
+        throw new Error('Не удалось получить баланс PlayerOK (сессия истекла или нет сети)');
+      }
+      balance = account.profile.balance?.withdrawable ?? 0;
 
       if (balance <= 500) {
         throw new Error('Слишком маленький баланс. Транзакция должна быть на сумму более 500₽');

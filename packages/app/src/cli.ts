@@ -23,8 +23,8 @@ interface ParsedArgs {
 }
 
 /** Флаги, которым требуется значение. Всё, что не перечислено, считается опечаткой. */
-const VALUE_FLAGS = new Set(['data-dir', 'plugins-dir', 'from']);
-const BOOLEAN_FLAGS = new Set(['dry-run', 'simulate', 'no-telegram', 'help']);
+const VALUE_FLAGS = new Set(['data-dir', 'plugins-dir', 'from', 'web-port', 'web-host', 'web-token']);
+const BOOLEAN_FLAGS = new Set(['dry-run', 'simulate', 'no-telegram', 'web', 'help']);
 
 function parseArgs(argv: string[]): ParsedArgs {
   const args = argv.slice(2);
@@ -91,6 +91,10 @@ PlayerOK Harness (pkh) v${VERSION} — Cordis 4 + TypeScript
   --dry-run            Запуск с MockPlayerokTransport без реальных сетевых запросов
   --simulate           Выполнить демо-сценарий событий в режиме --dry-run и завершиться
   --no-telegram        Не запускать Telegram-бота
+  --web                Поднять локальный read-only дашборд (по умолчанию 127.0.0.1:8787)
+  --web-port <порт>    Порт дашборда (или PKH_WEB_PORT)
+  --web-host <хост>    Адрес дашборда; не-loopback требует токен
+  --web-token <токен>  Токен доступа к дашборду (или PKH_WEB_TOKEN)
   --data-dir <путь>    Каталог для bot_settings/, bot_data/, logs/, plugins/
   --plugins-dir <путь> Каталог внешних плагинов
   --from <путь>        Исходный каталог для команды import-config
@@ -293,6 +297,13 @@ async function main(): Promise<void> {
   const simulate = Boolean(flags.simulate);
   const enableTelegram = !flags['no-telegram'] && !simulate;
 
+  const webPortRaw = typeof flags['web-port'] === 'string' ? Number(flags['web-port']) : undefined;
+  if (webPortRaw !== undefined && (!Number.isInteger(webPortRaw) || webPortRaw < 0 || webPortRaw > 65535)) {
+    console.error(`Некорректный --web-port: ${String(flags['web-port'])}`);
+    process.exitCode = 1;
+    return;
+  }
+
   const app = await createApplication({
     dataDir,
     pluginsDir,
@@ -300,7 +311,19 @@ async function main(): Promise<void> {
     enableTelegram,
     enableTimers: !simulate,
     enableInstanceLock: !simulate,
+    enableWeb: Boolean(flags.web),
+    webHost: typeof flags['web-host'] === 'string' ? flags['web-host'] : undefined,
+    webPort: webPortRaw,
+    webToken: typeof flags['web-token'] === 'string' ? flags['web-token'] : undefined,
   });
+
+  const dashboard = app.ctx.get('webDashboard', false);
+  if (dashboard?.address) {
+    const shown = dashboard.address.host === '0.0.0.0' ? '127.0.0.1' : dashboard.address.host;
+    app.ctx
+      .logger('pkh')
+      .info(`Дашборд: http://${shown}:${dashboard.address.port}/ (read-only, нужен токен)`);
+  }
 
   let shuttingDown = false;
   const shutdown = async (signal: string) => {

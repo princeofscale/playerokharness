@@ -1,0 +1,675 @@
+import crypto from 'node:crypto';
+import http, { type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import type { AddressInfo, Socket } from 'node:net';
+import type { Logger } from 'cordis';
+import {
+  type AccountInfo,
+  type CachedOrder,
+  type Context,
+  Service,
+  VERSION,
+} from '@pkh/core';
+import type { PlayerokService } from '@pkh/adapter';
+import {
+  type AccountView,
+  type BootErrorView,
+  type DealView,
+  type OverviewView,
+  type QueueStatsView,
+  type QueueTaskView,
+  renderDeals,
+  renderLogs,
+  renderNotFound,
+  renderOverview,
+  renderQueue,
+  renderUnauthorized,
+} from './render.js';
+
+export interface WebDashboardConfig {
+  /** When false the service stays mounted (and injectable) but never opens a socket. */
+  enabled?: boolean;
+  /** Listen address. A non-loopback address is only allowed together with a token. */
+  host?: string;
+  /** TCP port; 0 asks the OS for a free port (used by tests). */
+  port?: number;
+  /** Shared access token; defaults to the PKH_WEB_TOKEN environment variable. */
+  token?: string;
+}
+
+export const DEFAULT_WEB_HOST = '127.0.0.1';
+export const DEFAULT_WEB_PORT = 8787;
+export const TOKEN_COOKIE_NAME = 'pkh_web_token';
+
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
+const MAX_DEAL_ROWS = 100;
+const MAX_QUEUE_ROWS = 100;
+const MAX_LOG_LINES = 200;
+const ACCOUNT_CACHE_MS = 5_000;
+
+/**
+ * Thrown when the dashboard would be reachable from outside the machine without
+ * authentication. Refusing to boot is safer than silently exposing seller data.
+ */
+export class WebDashboardSecurityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'WebDashboardSecurityError';
+  }
+}
+
+/** Structural view of @pkh/plugin-retry-queue, which stays an optional dependency. */
+interface QueueTaskLike {
+  id: string;
+  kind: string;
+  status: string;
+  attempts: number;
+  maxAttempts: number;
+  lastError?: string;
+  nextRunAt: string;
+}
+
+interface RetryQueueLike {
+  getStats(): QueueStatsView;
+  list(status?: 'pending' | 'dead'): QueueTaskLike[];
+}
+
+function resolveToken(configToken?: string): string {
+  if (configToken !== undefined) return configToken.trim();
+  return (process.env.PKH_WEB_TOKEN ?? '').trim();
+}
+
+function isLoopbackHost(host: string): boolean {
+  return LOOPBACK_HOSTS.has(host.trim().toLowerCase());
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** Constant-time comparison so a wrong token cannot be guessed byte by byte. */
+function safeEqual(left: string, right: string): boolean {
+  const leftBytes = Buffer.from(left, 'utf8');
+  const rightBytes = Buffer.from(right, 'utf8');
+  if (leftBytes.length !== rightBytes.length) {
+    crypto.timingSafeEqual(leftBytes, leftBytes);
+    return false;
+  }
+  return crypto.timingSafeEqual(leftBytes, rightBytes);
+}
+
+function parseCookies(header: string | undefined): Record<string, string> {
+  const cookies: Record<string, string> = {};
+  if (!header) return cookies;
+  for (const part of header.split(';')) {
+    const separator = part.indexOf('=');
+    if (separator <= 0) continue;
+    const name = part.slice(0, separator).trim();
+    if (name.length === 0) continue;
+    cookies[name] = decodeCookieValue(part.slice(separator + 1).trim());
+  }
+  return cookies;
+}
+
+function decodeCookieValue(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function parseRequestUrl(req: IncomingMessage, host: string, port: number): URL {
+  const hostHeader = req.headers.host;
+  const base =
+    hostHeader && hostHeader.length > 0 ? `http://${hostHeader}` : `http://${host}:${port}`;
+  try {
+    return new URL(req.url ?? '/', base);
+  } catch {
+    return new URL('/', `http://${host}:${port}`);
+  }
+}
+
+function applySecurityHeaders(res: ServerResponse): void {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'none'; style-src 'unsafe-inline'; connect-src 'self'",
+  );
+}
+
+function serializeEvent(event: string, payload: unknown): string {
+  try {
+    return JSON.stringify({ event, at: new Date().toISOString(), data: payload });
+  } catch {
+    // Circular or BigInt payloads must not break the live stream.
+    return JSON.stringify({ event, at: new Date().toISOString(), data: null });
+  }
+}
+
+function toAccountView(account: AccountInfo): AccountView {
+  return {
+    id: account.id,
+    username: account.username,
+    email: account.email ?? null,
+    role: account.role ?? null,
+    isBlocked: Boolean(account.isBlocked),
+  };
+}
+
+function toDealView(order: CachedOrder): DealView {
+  return {
+    id: order.id,
+    itemId: order.item_id,
+    itemName: order.item_name,
+    price: order.price,
+    status: order.status,
+    date: order.date,
+  };
+}
+
+function toQueueTaskView(task: QueueTaskLike): QueueTaskView {
+  return {
+    id: task.id,
+    kind: task.kind,
+    status: task.status,
+    attempts: task.attempts,
+    maxAttempts: task.maxAttempts,
+    lastError: task.lastError ?? null,
+    nextRunAt: task.nextRunAt,
+  };
+}
+
+function compareDealsNewestFirst(left: DealView, right: DealView): number {
+  if (left.date === right.date) return right.id.localeCompare(left.id);
+  return right.date.localeCompare(left.date);
+}
+
+function compareQueueTasks(left: QueueTaskView, right: QueueTaskView): number {
+  if (left.status !== right.status) return left.status === 'pending' ? -1 : 1;
+  return left.nextRunAt.localeCompare(right.nextRunAt);
+}
+
+/**
+ * Read-only observability dashboard: a dependency-free node:http server that
+ * renders cached deals, the retry queue, logs and live events as HTML/JSON.
+ */
+export class WebDashboardService extends Service {
+  static provide = 'webDashboard';
+  static inject = ['storage', 'playerok', 'plugins'];
+
+  public readonly enabled: boolean;
+  public readonly host: string;
+  public readonly configuredPort: number;
+  public readonly startedAt: number = Date.now();
+
+  private readonly token: string;
+  private readonly log: Logger;
+  private boundPort: number | null = null;
+  /** Settles once the HTTP server bound, was disabled, or failed to bind. */
+  public readonly ready: Promise<void>;
+  /** Set when the server could not bind; `ready` still settles so callers never hang. */
+  public startupError: Error | null = null;
+  private resolveReady!: () => void;
+  private readonly sockets = new Set<Socket>();
+  private readonly streams = new Set<ServerResponse>();
+  private accountCache: { at: number; account: AccountInfo | null; error: string | null } | null =
+    null;
+
+  constructor(ctx: Context, config: WebDashboardConfig = {}) {
+    super(ctx, 'webDashboard');
+    this.log = ctx.logger('webDashboard');
+    this.ready = new Promise<void>((resolve) => {
+      this.resolveReady = resolve;
+    });
+    this.enabled = config.enabled !== false;
+    this.host = config.host ?? DEFAULT_WEB_HOST;
+    this.configuredPort = config.port ?? DEFAULT_WEB_PORT;
+    this.token = resolveToken(config.token);
+
+    if (
+      !Number.isInteger(this.configuredPort) ||
+      this.configuredPort < 0 ||
+      this.configuredPort > 65535
+    ) {
+      throw new RangeError(`Некорректный порт веб-панели: ${String(config.port)}`);
+    }
+
+    // A reachable-from-outside dashboard exposes the seller account, so it must
+    // have a token. Loopback-only deployments may run without one.
+    if (!isLoopbackHost(this.host) && this.token.length === 0) {
+      throw new WebDashboardSecurityError(
+        `Веб-панель не может слушать ${this.host} без токена: укажите token в конфиге или задайте PKH_WEB_TOKEN`,
+      );
+    }
+
+    ctx.effect(() => this.startHttpServer(), 'webDashboard:http');
+    ctx.effect(() => this.subscribeEvents(), 'webDashboard:events');
+  }
+
+  /** Actual bound address (port is resolved even when the config asked for port 0). */
+  public get address(): { host: string; port: number } | null {
+    return this.boundPort === null ? null : { host: this.host, port: this.boundPort };
+  }
+
+  public get url(): string | null {
+    return this.boundPort === null ? null : `http://${this.host}:${this.boundPort}`;
+  }
+
+  private async startHttpServer(): Promise<() => Promise<void>> {
+    if (!this.enabled) {
+      this.log.info('Веб-панель отключена в конфиге');
+      this.resolveReady();
+      return async () => {};
+    }
+
+    const server = http.createServer((req, res) => {
+      void this.handleRequest(req, res);
+    });
+
+    server.on('connection', (socket) => {
+      this.sockets.add(socket);
+      socket.on('close', () => {
+        this.sockets.delete(socket);
+      });
+    });
+
+    server.on('clientError', (error, socket) => {
+      this.log.debug(`Ошибка HTTP-клиента: ${describeError(error)}`);
+      if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+    });
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const onError = (error: Error) => {
+          server.off('listening', onListening);
+          reject(error);
+        };
+        const onListening = () => {
+          server.off('error', onError);
+          resolve();
+        };
+        server.once('error', onError);
+        server.once('listening', onListening);
+        server.listen(this.configuredPort, this.host);
+      });
+    } catch (error) {
+      const message = describeError(error);
+      this.log.error(
+        `Не удалось запустить веб-панель на ${this.host}:${this.configuredPort}: ${message}`,
+      );
+      this.startupError = new Error(
+        `Веб-панель не смогла занять ${this.host}:${this.configuredPort}: ${message}`,
+        { cause: error },
+      );
+      this.resolveReady();
+      throw this.startupError;
+    }
+
+    const address = server.address();
+    if (address !== null && typeof address === 'object') {
+      this.boundPort = (address as AddressInfo).port;
+    }
+    this.log.info(
+      `Веб-панель слушает ${this.url} ${this.token.length > 0 ? '(доступ по токену)' : '(без токена, только loopback)'}`,
+    );
+    this.resolveReady();
+
+    return async () => this.stopHttpServer(server);
+  }
+
+  private async stopHttpServer(server: Server): Promise<void> {
+    this.boundPort = null;
+    this.closeAllStreams();
+    // Let the SSE shutdown frames reach the sockets before tearing them down.
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+    for (const socket of this.sockets) {
+      socket.destroy();
+    }
+    this.sockets.clear();
+
+    if (!server.listening) return;
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve());
+      server.closeAllConnections();
+    });
+  }
+
+  private subscribeEvents(): () => void {
+    const disposers: Array<() => boolean> = [
+      this.ctx.on('playerok/new-deal', (event) => {
+        this.broadcast('playerok/new-deal', event);
+      }),
+      this.ctx.on('notify/log', (payload) => {
+        this.broadcast('notify/log', payload);
+      }),
+      this.onBus('retry/enqueued', (payload) => {
+        this.broadcast('retry/enqueued', payload);
+      }),
+      this.onBus('retry/dead-letter', (payload) => {
+        this.broadcast('retry/dead-letter', payload);
+      }),
+    ];
+
+    return () => {
+      for (const dispose of disposers) {
+        try {
+          dispose();
+        } catch {
+          // the shared bus may already be gone during shutdown
+        }
+      }
+      this.closeAllStreams();
+    };
+  }
+
+  /**
+   * `retry/*` events are declared by the optional @pkh/plugin-retry-queue package,
+   * which this dashboard must not depend on. Subscribe by name on the shared bus.
+   */
+  private onBus(event: string, listener: (payload: unknown) => void): () => boolean {
+    const register = this.ctx.on.bind(this.ctx) as unknown as (
+      name: string,
+      handler: (payload: unknown) => void,
+    ) => () => boolean;
+    return register(event, listener);
+  }
+
+  private broadcast(event: string, payload: unknown): void {
+    if (this.streams.size === 0) return;
+    const frame = `data: ${serializeEvent(event, payload)}\n\n`;
+    for (const stream of this.streams) {
+      try {
+        stream.write(frame);
+      } catch {
+        this.streams.delete(stream);
+      }
+    }
+  }
+
+  private closeAllStreams(): void {
+    for (const stream of this.streams) {
+      try {
+        stream.end('event: shutdown\ndata: {}\n\n');
+      } catch {
+        // client is already gone
+      }
+    }
+    this.streams.clear();
+  }
+
+  private async handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    try {
+      applySecurityHeaders(res);
+      const url = parseRequestUrl(req, this.host, this.boundPort ?? this.configuredPort);
+
+      if (req.method !== 'GET') {
+        this.sendText(res, 405, 'Метод не поддерживается: панель только для чтения');
+        return;
+      }
+
+      if (url.pathname === '/healthz') {
+        this.sendJson(res, 200, {
+          ok: true,
+          uptime: Math.round((Date.now() - this.startedAt) / 1000),
+          version: VERSION,
+        });
+        return;
+      }
+
+      const queryToken = url.searchParams.get('token');
+      const authorizedByQuery =
+        this.token.length > 0 && queryToken !== null && safeEqual(queryToken, this.token);
+
+      if (!authorizedByQuery && !this.isAuthorized(req)) {
+        this.sendHtml(res, 401, renderUnauthorized());
+        return;
+      }
+      if (authorizedByQuery) {
+        res.setHeader('Set-Cookie', this.buildTokenCookie());
+      }
+
+      await this.route(res, url);
+    } catch (error) {
+      this.log.error(
+        `Ошибка обработки запроса ${req.method ?? 'GET'} ${req.url ?? '/'}: ${describeError(error)}`,
+      );
+      if (!res.headersSent) {
+        this.sendText(res, 500, 'Внутренняя ошибка веб-панели');
+      } else if (!res.writableEnded) {
+        res.end();
+      }
+    }
+  }
+
+  private isAuthorized(req: IncomingMessage): boolean {
+    if (this.token.length === 0) return true; // loopback-only mode, enforced in the constructor
+    const cookieToken = parseCookies(req.headers.cookie)[TOKEN_COOKIE_NAME];
+    return cookieToken !== undefined && safeEqual(cookieToken, this.token);
+  }
+
+  private buildTokenCookie(): string {
+    return `${TOKEN_COOKIE_NAME}=${encodeURIComponent(this.token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800`;
+  }
+
+  private async route(res: ServerResponse, url: URL): Promise<void> {
+    switch (url.pathname) {
+      case '/': {
+        this.sendHtml(res, 200, renderOverview(await this.buildOverview()));
+        return;
+      }
+      case '/deals': {
+        this.sendHtml(res, 200, renderDeals(this.collectDeals()));
+        return;
+      }
+      case '/queue': {
+        this.sendHtml(res, 200, renderQueue(this.collectQueue()));
+        return;
+      }
+      case '/logs': {
+        this.sendHtml(res, 200, renderLogs(this.readLogLines()));
+        return;
+      }
+      case '/api/status': {
+        this.sendJson(res, 200, { ok: true, ...(await this.buildOverview()) });
+        return;
+      }
+      case '/api/deals': {
+        this.sendJson(res, 200, this.collectDeals());
+        return;
+      }
+      case '/api/queue': {
+        this.sendJson(res, 200, this.collectQueue());
+        return;
+      }
+      case '/events': {
+        this.handleEvents(res);
+        return;
+      }
+      default: {
+        this.sendHtml(res, 404, renderNotFound());
+      }
+    }
+  }
+
+  private handleEvents(res: ServerResponse): void {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    res.write(': connected\n\n');
+    this.streams.add(res);
+
+    const cleanup = () => {
+      this.streams.delete(res);
+    };
+    res.on('close', cleanup);
+    res.on('error', cleanup);
+  }
+
+  private async buildOverview(): Promise<OverviewView> {
+    const account = await this.readAccount();
+    return {
+      version: VERSION,
+      uptimeSeconds: Math.round((Date.now() - this.startedAt) / 1000),
+      host: this.host,
+      port: this.boundPort ?? this.configuredPort,
+      account: account.account ? toAccountView(account.account) : null,
+      accountError: account.error,
+      cachedOrders: this.countCachedOrders(),
+      queue: this.readQueueStats(),
+      plugins: this.readPluginSummary(),
+      bootErrors: this.readBootErrors(),
+    };
+  }
+
+  private async readAccount(): Promise<{ account: AccountInfo | null; error: string | null }> {
+    const playerok: PlayerokService = this.ctx.playerok;
+    const current: AccountInfo | null = playerok.account;
+    if (current) return { account: current, error: null };
+
+    const now = Date.now();
+    if (this.accountCache && now - this.accountCache.at < ACCOUNT_CACHE_MS) {
+      return { account: this.accountCache.account, error: this.accountCache.error };
+    }
+
+    let account: AccountInfo | null = null;
+    let error: string | null = null;
+    try {
+      account = await playerok.refreshAccount();
+      if (!account) error = 'PlayerOK не вернул данные аккаунта';
+    } catch (cause) {
+      error = describeError(cause);
+    }
+    this.accountCache = { at: now, account, error };
+    if (error) {
+      this.log.warn(`Не удалось обновить аккаунт для веб-панели: ${error}`);
+    }
+    return { account, error };
+  }
+
+  private countCachedOrders(): number {
+    try {
+      return Object.keys(this.ctx.storage.getCachedOrders()).length;
+    } catch (error) {
+      this.log.warn(`Не удалось прочитать кэш сделок: ${describeError(error)}`);
+      return 0;
+    }
+  }
+
+  private collectDeals(): { total: number; deals: DealView[] } {
+    let cached: Record<string, CachedOrder>;
+    try {
+      cached = this.ctx.storage.getCachedOrders();
+    } catch (error) {
+      this.log.warn(`Не удалось прочитать кэш сделок: ${describeError(error)}`);
+      return { total: 0, deals: [] };
+    }
+
+    const deals = Object.values(cached).map(toDealView).sort(compareDealsNewestFirst);
+    return { total: deals.length, deals: deals.slice(0, MAX_DEAL_ROWS) };
+  }
+
+  private retryQueue(): RetryQueueLike | null {
+    return (this.ctx.get('retryQueue', false) as RetryQueueLike | undefined) ?? null;
+  }
+
+  private readQueueStats(): QueueStatsView | null {
+    const queue = this.retryQueue();
+    if (!queue) return null;
+    try {
+      return queue.getStats();
+    } catch (error) {
+      this.log.warn(`Не удалось получить статистику очереди: ${describeError(error)}`);
+      return null;
+    }
+  }
+
+  private collectQueue(): { stats: QueueStatsView | null; tasks: QueueTaskView[] } {
+    const queue = this.retryQueue();
+    if (!queue) return { stats: null, tasks: [] };
+    try {
+      const stats = queue.getStats();
+      const tasks = [...queue.list('pending'), ...queue.list('dead')]
+        .map(toQueueTaskView)
+        .sort(compareQueueTasks)
+        .slice(0, MAX_QUEUE_ROWS);
+      return { stats, tasks };
+    } catch (error) {
+      this.log.warn(`Не удалось прочитать очередь повторов: ${describeError(error)}`);
+      return { stats: null, tasks: [] };
+    }
+  }
+
+  private readPluginSummary(): { enabled: number; total: number } {
+    try {
+      const records = this.ctx.plugins.list();
+      return { enabled: records.filter((record) => record.enabled).length, total: records.length };
+    } catch (error) {
+      this.log.warn(`Не удалось получить список плагинов: ${describeError(error)}`);
+      return { enabled: 0, total: 0 };
+    }
+  }
+
+  private readBootErrors(): BootErrorView[] {
+    const report = this.ctx.get('bootReport', false);
+    if (!report) return [];
+    try {
+      return report.getErrors().slice(0, 10).map((error) => ({
+        module: error.module,
+        stage: error.stage,
+        text: error.text,
+      }));
+    } catch (error) {
+      this.log.warn(`Не удалось прочитать отчёт о запуске: ${describeError(error)}`);
+      return [];
+    }
+  }
+
+  private readLogLines(): string[] {
+    const sink = this.ctx.get('logSink', false);
+    if (!sink) return [];
+    try {
+      return sink.getRecentLines(MAX_LOG_LINES).slice(-MAX_LOG_LINES);
+    } catch (error) {
+      this.log.warn(`Не удалось прочитать логи: ${describeError(error)}`);
+      return [];
+    }
+  }
+
+  private sendHtml(res: ServerResponse, status: number, body: string): void {
+    this.send(res, status, 'text/html; charset=utf-8', body);
+  }
+
+  private sendJson(res: ServerResponse, status: number, payload: unknown): void {
+    this.send(res, status, 'application/json; charset=utf-8', `${JSON.stringify(payload)}\n`);
+  }
+
+  private sendText(res: ServerResponse, status: number, body: string): void {
+    this.send(res, status, 'text/plain; charset=utf-8', `${body}\n`);
+  }
+
+  private send(res: ServerResponse, status: number, contentType: string, body: string): void {
+    if (res.headersSent) {
+      if (!res.writableEnded) res.end();
+      return;
+    }
+    res.writeHead(status, {
+      'Content-Type': contentType,
+      'Content-Length': Buffer.byteLength(body),
+    });
+    res.end(body);
+  }
+}
+
+declare module 'cordis' {
+  interface Context {
+    webDashboard: WebDashboardService;
+  }
+}

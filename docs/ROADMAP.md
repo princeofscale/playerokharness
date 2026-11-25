@@ -124,3 +124,28 @@ Ordered by value per unit of work.
   prevented by `LockService`, not by the queue itself.
 - Telegram `callback_data` is capped at 64 bytes; keys longer than a few characters are
   truncated in the UI (rare, cosmetic).
+
+## 5. Round 2 (2026-11-25, same day) — shipped
+
+- **@pkh/plugin-web** — dependency-free read-only dashboard (node:http + SSE):
+  /, /deals, /queue, /logs, /api/*, /events, /healthz. Token-gated with
+  timingSafeEqual + httpOnly cookie; refuses to bind a non-loopback host without a token.
+  Wired into createApplication (enableWeb / --web / PKH_WEB_*) with a ready promise, so
+  startup ordering is deterministic and a bind failure becomes a log line.
+- **Contract guard** — packages/playerok/src/schemas.ts: 13 loose Zod schemas for the
+  GraphQL/WS payloads we consume, applied at 14 call sites. Drift is recorded as
+  ContractIssue (ring buffer 50) instead of throwing, mapping stays best-effort, and
+  bootstrap logs newly observed drift every 10 minutes.
+- **Retry-queue leases** — pending | processing | dead with claimedAt/claimedBy,
+  expired-lease reclaim (5 min, emitted as retry/lease-reclaimed), DLQ retention
+  (14 days / 500 tasks, pruned in the poll pass) and ±20 % backoff jitter.
+- **Automation fixes** — restore-by-id for SOLD items, stock rollback when the retry
+  queue rejects a task, first-message !продавец escalation, honest withdrawal errors,
+  attribute-safe notification escaping.
+- **Config safety** — getConfig() no longer mutates the parsed object, and set() strips
+  any value still equal to a PKH_* override, so a settings round-trip cannot persist an
+  environment secret.
+- **Tooling** — pretest builds the workspace; CI now does a cold (pnpm clean) build.
+
+Still open from section 3: SQLite persistence, a stock model with reserved/sold states,
+@grammyjs/runner, plugin manifest/signature, and mutation-response contract schemas.

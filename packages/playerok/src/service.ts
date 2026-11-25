@@ -28,6 +28,7 @@ import {
 } from './errors.js';
 import { GraphQLPlayerokTransport } from './graphql-transport.js';
 import { MockPlayerokTransport, type MockTransportSeed } from './mock-transport.js';
+import type { ContractIssue } from './schemas.js';
 import type {
   BinaryUpload,
   CreateItemParams,
@@ -507,6 +508,16 @@ export class PlayerokService extends Service {
 
   public removeTransaction(transactionId: string): Promise<Transaction> {
     return this.transport.removeTransaction(transactionId);
+  }
+
+  /**
+   * Recent response-contract issues reported by the transport.
+   *
+   * Empty when the active transport does not validate payloads (the mock transport)
+   * or when no field drift has been observed yet.
+   */
+  public getContractIssues(): ContractIssue[] {
+    return this.transport.getContractIssues?.() ?? [];
   }
 }
 

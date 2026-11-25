@@ -33,6 +33,7 @@ import {
 } from '@pkh/core';
 import { computeOrdersStats, type StatsPeriod, type TrackedPosition } from '@pkh/plugin-automation';
 import type { RetryTask } from '@pkh/plugin-retry-queue';
+import { fitCallback } from './callbacks.js';
 import type { BindingBucket, BindingStoreKey } from './fsm.js';
 
 export interface RenderedView {
@@ -333,7 +334,10 @@ export function renderWithdrawalSettings(cfg: BotConfig): RenderedView {
 export function renderWithdrawalCards(cards: VerifiedCard[]): RenderedView {
   const kb = new InlineKeyboard();
   for (const c of cards) {
-    kb.text(`💳 ${c.cardFirstSix}****${c.cardLastFour} (${c.cardType ?? 'CARD'})`, `withdraw:set_card:${c.id}`).row();
+    kb.text(
+      `💳 ${c.cardFirstSix}****${c.cardLastFour} (${c.cardType ?? 'CARD'})`,
+      fitCallback('withdraw:set_card', c.id),
+    ).row();
   }
   kb.text('⬅️ Назад', 'menu:withdrawal');
   return {
@@ -345,7 +349,7 @@ export function renderWithdrawalCards(cards: VerifiedCard[]): RenderedView {
 export function renderWithdrawalSbpBanks(banks: SbpBankMember[]): RenderedView {
   const kb = new InlineKeyboard();
   for (const b of banks.slice(0, 15)) {
-    kb.text(`🏦 ${b.name}`, `withdraw:set_sbp:${b.id}`).row();
+    kb.text(`🏦 ${b.name}`, fitCallback('withdraw:set_sbp', b.id)).row();
   }
   kb.text('⬅️ Назад', 'menu:withdrawal');
   return {
@@ -440,7 +444,7 @@ export function renderCommandsList(commands: CustomCommandsSettings): RenderedVi
     : ['<i>Кастомных команд пока нет.</i>'];
   const kb = new InlineKeyboard().text('➕ Добавить команду', 'fsm:add_command').row();
   for (const k of keys.slice(0, 12)) {
-    kb.text(`🗑 ${k}`, `cmd:del:${encodeURIComponent(k)}`).row();
+    kb.text(`🗑 ${k}`, fitCallback('cmd:del', k)).row();
   }
   kb.text('⬅️ В меню', 'menu:main');
   return { text: `<b>❗ Кастомные команды (${keys.length})</b>\n\n${lines.join('\n')}`, keyboard: kb };
@@ -561,7 +565,10 @@ export function renderBlacklist(entries: BlacklistEntryWithUser[], page = 0): Re
     : ['<i>Чёрный список пуст.</i>'];
   const kb = new InlineKeyboard().text('➕ Добавить в ЧС', 'fsm:add_blacklist').row();
   for (const e of slice) {
-    kb.text(`✅ Убрать ${e.username}`, `bl:del:${encodeURIComponent(e.username)}:${safePage}`).row();
+    kb.text(
+      `✅ Убрать ${e.username}`,
+      fitCallback('bl:del', e.username + ':' + safePage),
+    ).row();
   }
   appendPager(kb, safePage, totalPages, 'bl:list');
   kb.text('⬅️ В меню', 'menu:main');
@@ -643,7 +650,7 @@ export function renderChatsList(chats: Chat[], myId?: string, page = 0): Rendere
   for (const c of slice) {
     const other = c.users.find((u) => u.id !== myId) ?? c.users[0];
     const unread = c.unreadMessagesCounter ? ` (${c.unreadMessagesCounter})` : '';
-    kb.text(`💬 ${other?.username ?? c.id}${unread}`, `chat:view:${c.id}`).row();
+    kb.text(`💬 ${other?.username ?? c.id}${unread}`, fitCallback('chat:view', c.id)).row();
   }
   appendPager(kb, safePage, totalPages, 'chats:page');
   kb.text('⬅️ В меню', 'menu:main');
@@ -672,11 +679,12 @@ export function renderChatDetail(
   ].join('\n');
 
   const kb = new InlineKeyboard()
-    .text('✏️ Написать / отправить фото', `chat:reply:${chat.id}`).row();
+    .text('✏️ Написать / отправить фото', fitCallback('chat:reply', chat.id)).row();
   fastReplies.slice(0, 4).forEach((fr, idx) => {
-    kb.text(`⚡ ${fr.name.slice(0, 18)}`, `chat:fr:${chat.id}:${idx}`).row();
+    // chat id + reply index travel together: both are needed to send the right reply
+    kb.text(`⚡ ${fr.name.slice(0, 18)}`, fitCallback('chat:fr', chat.id + ':' + idx)).row();
   });
-  kb.text('🔄 Обновить', `chat:view:${chat.id}`).text('⬅️ К чатам', 'chats:page:0');
+  kb.text('🔄 Обновить', fitCallback('chat:view', chat.id)).text('⬅️ К чатам', 'chats:page:0');
   return { text, keyboard: kb };
 }
 
@@ -690,7 +698,7 @@ export function renderDealsList(deals: ItemDeal[], filter = 'ALL', page = 0): Re
     .row();
 
   for (const d of slice) {
-    kb.text(`📋 ${d.user.username} · ${d.item.price}₽ (${d.status})`, `deal:view:${d.id}`).row();
+    kb.text(`📋 ${d.user.username} · ${d.item.price}₽ (${d.status})`, fitCallback('deal:view', d.id)).row();
   }
   appendPager(kb, safePage, totalPages, `deals:${filter}`);
   kb.text('⬅️ В меню', 'menu:main');
@@ -707,8 +715,8 @@ export function renderDealDetail(deal: ItemDeal): RenderedView {
     `Сумма: <b>${deal.item.price}₽</b>`,
   ].join('\n');
   const kb = new InlineKeyboard()
-    .text('✅ Подтвердить (SENT)', `deal:confirm:${deal.id}`)
-    .text('📦 Возврат', `deal:refund:${deal.id}`).row()
+    .text('✅ Подтвердить (SENT)', fitCallback('deal:confirm', deal.id))
+    .text('📦 Возврат', fitCallback('deal:refund', deal.id)).row()
     .text('⬅️ К сделкам', 'deals:ALL:0');
   return { text, keyboard: kb };
 }
@@ -723,7 +731,7 @@ export function renderItemsList(items: ItemProfile[], filter = 'APPROVED', page 
     .row();
 
   for (const it of slice) {
-    kb.text(`🛍️ ${it.name.slice(0, 26)} · ${it.price}₽`, `item:view:${it.id}`).row();
+    kb.text(`🛍️ ${it.name.slice(0, 26)} · ${it.price}₽`, fitCallback('item:view', it.id)).row();
   }
   appendPager(kb, safePage, totalPages, `items:${filter}`);
   kb.text('⬅️ В меню', 'menu:main');
@@ -740,8 +748,8 @@ export function renderItemDetail(item: ItemProfile): RenderedView {
     `Позиция: <b>${item.sequence ?? '—'}</b>`,
   ].join('\n');
   const kb = new InlineKeyboard()
-    .text('⬆️ Поднять', `item:bump:${item.id}`)
-    .text('♻️ Восстановить', `item:restore:${item.id}`).row()
+    .text('⬆️ Поднять', fitCallback('item:bump', item.id))
+    .text('♻️ Восстановить', fitCallback('item:restore', item.id)).row()
     .text('⬅️ К товарам', 'items:APPROVED:0');
   return { text, keyboard: kb };
 }
@@ -791,8 +799,8 @@ export function renderModulesList(plugins: LoadedPluginRecord[]): RenderedView {
     : ['<i>Внешние плагины не установлены. Отправьте .mjs/.js файл или положите его в plugins/.</i>'];
 
   for (const p of plugins) {
-    kb.text(`${p.enabled ? '🔴 Выкл' : '🟢 Вкл'} ${p.meta.name}`, `mod:toggle:${encodeURIComponent(p.id)}`)
-      .text('🗑', `mod:del:${encodeURIComponent(p.id)}`)
+    kb.text(`${p.enabled ? '🔴 Выкл' : '🟢 Вкл'} ${p.meta.name}`, fitCallback('mod:toggle', p.id))
+      .text('🗑', fitCallback('mod:del', p.id))
       .row();
   }
   kb.text('⬅️ В меню', 'menu:main');
@@ -897,10 +905,10 @@ export function renderRetryQueue(tasks: RetryTask[]): RenderedView {
 
   for (const task of tasks.slice(0, 6)) {
     if (task.status === 'dead') {
-      kb.text(`♻️ ${task.id}`, `rq:retry:${task.id}`)
-        .text(`🗑 ${task.id}`, `rq:del:${task.id}`).row();
+      kb.text(`♻️ ${task.id}`, fitCallback('rq:retry', task.id))
+        .text(`🗑 ${task.id}`, fitCallback('rq:del', task.id)).row();
     } else {
-      kb.text(`🗑 Удалить ${task.id}`, `rq:del:${task.id}`).row();
+      kb.text(`🗑 Удалить ${task.id}`, fitCallback('rq:del', task.id)).row();
     }
   }
 

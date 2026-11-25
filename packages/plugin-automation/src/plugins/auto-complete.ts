@@ -26,7 +26,11 @@ export const autoCompletePlugin = {
           if (!item.name && item.id) {
             try {
               item = await ctx.playerok.getItem({ id: item.id });
-            } catch {
+            } catch (err) {
+              // Silently returning left the deal uncompleted with no trace anywhere.
+              log.warn(
+                `Не удалось получить товар ${item.id} для сделки ${event.deal.id}: ${err instanceof Error ? err.message : String(err)} — авто-подтверждение отложено`,
+              );
               return;
             }
           }

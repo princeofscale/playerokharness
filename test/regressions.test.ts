@@ -13,6 +13,7 @@ import {
 import { MockPlayerokTransport, PlayerokService } from '@pkh/adapter';
 import { RetryQueueService } from '@pkh/plugin-retry-queue';
 import { redactSnapshotSecrets } from '@pkh/plugin-telegram';
+import { createApplication } from '@pkh/app';
 
 const tempDirs: string[] = [];
 
@@ -151,6 +152,23 @@ describe('Regression guards for the 2026-11-25 code review', () => {
     expect(snapshot.config.telegram.api.token).toBe('123456789:ABCDEFGHIJ');
   });
 
+  it('never persists PKH_* environment secrets when a caller saves the returned config', async () => {
+    const dir = makeTempDir();
+    const ctx = new Context();
+    await ctx.use(StorageService, { baseDir: dir });
+
+    process.env.PKH_TELEGRAM_TOKEN = '123456789:FROM_ENVIRONMENT';
+    const loaded = ctx.storage.getConfig();
+    expect(loaded.telegram.api.token).toBe('123456789:FROM_ENVIRONMENT');
+
+    // A settings screen that round-trips the effective config must not write the secret.
+    ctx.storage.setConfig(loaded);
+    delete process.env.PKH_TELEGRAM_TOKEN;
+
+    expect(ctx.storage.getConfig().telegram.api.token).toBe('');
+    await ctx.fiber.dispose();
+  });
+
   it('reschedules a task whose handler is not registered yet instead of dead-lettering it', async () => {
     const dir = makeTempDir();
     const ctx = new Context();
@@ -173,3 +191,100 @@ describe('Regression guards for the 2026-11-25 code review', () => {
     await ctx.fiber.dispose();
   });
 });
+
+describe('Automation behaviour regressions (round 2)', () => {
+  const buyer = { id: 'buyer-1', username: 'buyer_one' };
+
+  it('escalates !продавец even when it is the buyer first message', async () => {
+    const dir = makeTempDir();
+    const mock = new MockPlayerokTransport();
+    const app = await createApplication({
+      dataDir: dir,
+      dryRun: true,
+      transport: mock,
+      enableTelegram: false,
+      enableTimers: false,
+      enableInstanceLock: false,
+      silentConsole: true,
+    });
+
+    const escalations: unknown[] = [];
+    app.ctx.on('notify/call-seller', (payload) => {
+      escalations.push(payload);
+    });
+
+    await app.start();
+    await mock.simulateNewMessage('chat-first', buyer, '!продавец');
+    await sleep(60);
+
+    expect(escalations.length).toBe(1);
+    await app.stop();
+  });
+
+  it('greets a brand-new buyer whose first message is ordinary text exactly once', async () => {
+    const dir = makeTempDir();
+    const mock = new MockPlayerokTransport();
+    const app = await createApplication({
+      dataDir: dir,
+      dryRun: true,
+      transport: mock,
+      enableTelegram: false,
+      enableTimers: false,
+      enableInstanceLock: false,
+      silentConsole: true,
+    });
+
+    const sent: string[] = [];
+    const originalSend = mock.sendMessage.bind(mock);
+    mock.sendMessage = async (params) => {
+      if (params.text) sent.push(params.text);
+      return originalSend(params);
+    };
+
+    await app.start();
+    await mock.simulateNewMessage('chat-greet', buyer, 'привет, есть в наличии?');
+    await sleep(60);
+    const greetingCount = sent.filter((text) => text.includes('buyer_one')).length;
+    expect(greetingCount).toBeGreaterThanOrEqual(1);
+
+    await app.stop();
+  });
+
+  it('returns a reserved key to stock when the retry queue rejects the task', async () => {
+    const dir = makeTempDir();
+    const mock = new MockPlayerokTransport();
+    const app = await createApplication({
+      dataDir: dir,
+      dryRun: true,
+      transport: mock,
+      enableTelegram: false,
+      enableTimers: false,
+      enableInstanceLock: false,
+      silentConsole: true,
+    });
+
+    // The mock seeds a fixed demo item; getMyItems() paging depends on its status.
+    const item = await mock.getItem({ id: '11111111-1111-1111-1111-111111111111' });
+    expect(item.name).toBeTruthy();
+
+    app.ctx.storage.set('auto_deliveries', [
+      { keyphrases: [item.name], piece: true, goods: ['RESERVED-KEY-1'] },
+    ]);
+
+    // Force the "API refused the send" path, then make the queue write fail too.
+    mock.sendMessage = async () => null;
+    app.ctx.retryQueue.enqueue = async () => {
+      throw new Error('queue store unavailable');
+    };
+
+    await app.start();
+    await mock.simulateNewDeal({ dealId: 'deal-rollback', buyer, itemId: item.id });
+    await sleep(80);
+
+    const rules = app.ctx.storage.getAutoDeliveries();
+    expect(rules[0]?.goods).toContain('RESERVED-KEY-1');
+
+    await app.stop();
+  });
+});
+

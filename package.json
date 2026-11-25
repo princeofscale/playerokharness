@@ -17,6 +17,7 @@
     "build": "pnpm -r --sort build",
     "typecheck": "pnpm -r --sort typecheck",
     "lint": "eslint packages test",
+    "pretest": "pnpm -r --sort build",
     "test": "vitest run",
     "test:watch": "vitest",
     "dev": "tsx packages/app/src/cli.ts",

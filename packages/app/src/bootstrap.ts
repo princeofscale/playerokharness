@@ -19,9 +19,10 @@ import {
   type MockTransportSeed,
   type PlayerokTransport,
 } from '@pkh/adapter';
-import { automationBundle } from '@pkh/plugin-automation';
+import { mountAutomation } from '@pkh/plugin-automation';
 import { RetryQueueService } from '@pkh/plugin-retry-queue';
 import { TelegramService } from '@pkh/plugin-telegram';
+import { WebDashboardService } from '@pkh/plugin-web';
 
 export interface AppOptions {
   dataDir?: string;
@@ -36,6 +37,11 @@ export interface AppOptions {
   mockSeed?: MockTransportSeed;
   telegramToken?: string;
   autoRecheckIntervalMs?: number;
+  /** Mount the read-only HTTP dashboard (defaults off; also enabled by PKH_WEB_ENABLED). */
+  enableWeb?: boolean;
+  webHost?: string;
+  webPort?: number;
+  webToken?: string;
 }
 
 export interface PlayerokApplication {
@@ -71,13 +77,56 @@ export async function createApplication(options: AppOptions = {}): Promise<Playe
     enableMaintenanceLoops: options.enableTimers ?? true,
   });
 
+  // Contract-drift watchdog: PlayerOK can rename a GraphQL field without notice. The
+  // transport records those as ContractIssue[] and keeps mapping best-effort, so the
+  // only way to notice is to look — surface the first occurrences in the log.
+  if (options.enableTimers !== false) {
+    let reportedContractIssues = 0;
+    safeInterval(
+      ctx,
+      () => {
+        const issues = ctx.playerok.getContractIssues();
+        if (issues.length <= reportedContractIssues) return;
+        reportedContractIssues = issues.length;
+        const sample = issues
+          .slice(-3)
+          .map((issue) => `${issue.op} [${issue.paths.join(', ')}]`)
+          .join('; ');
+        ctx.logger('playerok').warn(`Дрейф контракта PlayerOK API: ${sample}`);
+      },
+      10 * 60 * 1000,
+      'playerok:contractDrift',
+    );
+  }
+
   await ctx.use(RetryQueueService, {
     enableTimer: options.enableTimers ?? true,
   });
 
-  await ctx.use(automationBundle, {
+  // Mounted on the root context on purpose: services provided inside a nested bundle
+  // are invisible to root-level consumers such as the Telegram panel and the web
+  // dashboard, which must read autoBump/autoRestore/autoWithdrawal through ctx.get().
+  mountAutomation(ctx, {
     enableTimers: options.enableTimers ?? true,
   });
+
+  const webEnabled = options.enableWeb ?? isTruthyEnv(process.env.PKH_WEB_ENABLED);
+  // The dashboard binds inside an effect, which cordis does not await; `ready` keeps
+  // startup ordering deterministic and turns a bind failure into a log line.
+  await ctx.use(WebDashboardService, {
+    enabled: webEnabled,
+    host: options.webHost ?? process.env.PKH_WEB_HOST,
+    port: options.webPort ?? (process.env.PKH_WEB_PORT ? Number(process.env.PKH_WEB_PORT) : undefined),
+    token: options.webToken ?? process.env.PKH_WEB_TOKEN,
+  });
+
+  const dashboard = ctx.get('webDashboard', false);
+  if (dashboard) {
+    await dashboard.ready;
+    if (dashboard.startupError) {
+      ctx.logger('pkh').error(`Веб-панель недоступна: ${dashboard.startupError.message}`);
+    }
+  }
 
   if (options.enableTelegram !== false) {
     await ctx.use(TelegramService, {
@@ -235,4 +284,9 @@ export async function runDryRunSimulation(ctx: Context): Promise<void> {
   log.info(
     `Итог симуляции: отправлено сообщений=${mock.sentMessages.length}, обновлено сделок=${mock.updatedDeals.length}, восстановлено товаров=${mock.publishedItems.length}`,
   );
+}
+
+function isTruthyEnv(value: string | undefined): boolean {
+  if (!value) return false;
+  return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
 }

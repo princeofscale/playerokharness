@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import os from 'node:os';
 import {
   Context,
   escapeHtml,
@@ -8,6 +9,16 @@ import {
   z,
 } from '@pkh/core';
 import '@pkh/adapter';
+
+/**
+ * Lifecycle of a queued task:
+ * - `pending`     — waiting for `nextRunAt`, nobody is working on it;
+ * - `processing`  — leased by a poll pass (`claimedAt`/`claimedBy`), hidden from other passes;
+ * - `dead`        — exhausted its attempts and lives in the Dead-Letter Queue.
+ */
+export const RetryTaskStatusSchema = z.enum(['pending', 'processing', 'dead']);
+
+export type RetryTaskStatus = z.infer<typeof RetryTaskStatusSchema>;
 
 export const RetryTaskSchema = z.object({
   id: z.string(),
@@ -19,7 +30,13 @@ export const RetryTaskSchema = z.object({
   nextRunAt: z.string(),
   createdAt: z.string(),
   lastError: z.string().optional(),
-  status: z.enum(['pending', 'dead']).default('pending'),
+  status: RetryTaskStatusSchema.default('pending'),
+  /** Lease timestamp (ISO): set when a pass claims the task, cleared when the attempt ends. */
+  claimedAt: z.string().optional(),
+  /** Lease owner identity `<pid>@<hostname>`: lets operators see who held an expired lease. */
+  claimedBy: z.string().optional(),
+  /** When the task entered the DLQ; anchors retention so a long-lived task is not pruned on birth. */
+  deadAt: z.string().optional(),
 });
 
 export type RetryTask = z.infer<typeof RetryTaskSchema>;
@@ -47,19 +64,94 @@ export interface RetryQueueConfig {
   maxDelayMs?: number;
   defaultMaxAttempts?: number;
   enableTimer?: boolean;
+  /** A task stuck in 'processing' for longer than this is reclaimed by the next poll pass. */
+  leaseMs?: number;
+  /** Dead tasks whose DLQ entry is older than this many days are pruned (default 14). */
+  deadRetentionDays?: number;
+  /** Upper bound on stored tasks; dead tasks are pruned oldest-first to enforce it (default 500). */
+  maxTasks?: number;
 }
 
 export interface RetryQueueStats {
+  /** Every task that is not dead, leased ('processing') ones included. */
   pending: number;
   dead: number;
   total: number;
+  /** Leased tasks — a subset of `pending`. Filled by `getStats(true)` only. */
+  processing?: number;
+  /** Expired leases reclaimed since this service started. Filled by `getStats(true)` only. */
+  expiredLeases?: number;
+  /** Tasks removed by the retention policy since this service started. Filled by `getStats(true)` only. */
+  pruned?: number;
+}
+
+export interface ProcessDueResult {
+  succeeded: number;
+  rescheduled: number;
+  deadLettered: number;
+}
+
+/** Outcome of one atomic claim attempt inside a poll pass. */
+interface ClaimOutcome {
+  task: RetryTask | null;
+  reclaimedLease: boolean;
+  /** Owner of the lease that had expired, for the audit log and the reclaim event. */
+  previousClaimedBy?: string;
 }
 
 const STORE_KEY = 'retry_queue';
 
+/** `<pid>@<hostname>` of the process that owns a lease; written into every claim. */
+export function currentWorkerId(): string {
+  return `${process.pid}@${os.hostname()}`;
+}
+
 export function computeBackoffMs(attempts: number, baseDelayMs: number, maxDelayMs: number): number {
   const exponent = Math.max(0, attempts - 1);
   return Math.min(baseDelayMs * Math.pow(2, exponent), maxDelayMs);
+}
+
+/** Jitter spread used by {@link nextDelay}: plus or minus 20% around the pure backoff. */
+export const BACKOFF_JITTER_RATIO = 0.2;
+
+/**
+ * Backoff for the next attempt with +/-20% jitter.
+ *
+ * `computeBackoffMs` stays deterministic (tests and operators rely on it); the jitter lives
+ * here so a thundering herd of tasks that failed at the same instant does not retry in lockstep.
+ * `random` is injectable, which keeps this function testable without mocking Math.random.
+ */
+export function nextDelay(
+  attempts: number,
+  baseDelayMs: number,
+  maxDelayMs: number,
+  random: () => number = Math.random,
+): number {
+  const deterministic = computeBackoffMs(attempts, baseDelayMs, maxDelayMs);
+  const sample = random();
+  const normalized = Number.isFinite(sample) ? Math.min(1, Math.max(0, sample)) : 0.5;
+  const factor = 1 + BACKOFF_JITTER_RATIO * (normalized * 2 - 1);
+  // The jittered value may exceed maxDelayMs by up to BACKOFF_JITTER_RATIO on purpose: the cap
+  // stays authoritative for the deterministic series, the spread only decorrelates retries.
+  return Math.round(deterministic * factor);
+}
+
+/**
+ * A payload error that can never succeed. The poll pass sends such a task straight to the
+ * Dead-Letter Queue instead of burning its remaining attempts on a deterministic failure.
+ */
+export class PermanentTaskError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PermanentTaskError';
+  }
+}
+
+const ITEM_DEAL_STATUS_VALUES: readonly string[] = Object.values(ItemDealStatuses);
+
+/** Type guard over `ItemDealStatuses`, used instead of casting arbitrary payload strings. */
+export function isItemDealStatus(value: string): value is ItemDealStatuses {
+  return ITEM_DEAL_STATUS_VALUES.includes(value);
 }
 
 export class RetryQueueService extends Service {
@@ -73,6 +165,15 @@ export class RetryQueueService extends Service {
   private readonly baseDelayMs: number;
   private readonly maxDelayMs: number;
   private readonly defaultMaxAttempts: number;
+  private readonly leaseMs: number;
+  private readonly deadRetentionDays: number;
+  private readonly maxTasks: number;
+  /** Lease owner written into every claim: `<pid>@<hostname>`. */
+  private readonly workerId = currentWorkerId();
+  /** Expired leases reclaimed since start — observability counter, see getStats(true). */
+  private expiredLeases = 0;
+  /** Tasks dropped by the retention policy since start; see getStats(true). */
+  private prunedTasks = 0;
 
   constructor(ctx: Context, config: RetryQueueConfig = {}) {
     super(ctx, 'retryQueue');
@@ -80,6 +181,9 @@ export class RetryQueueService extends Service {
     this.baseDelayMs = config.baseDelayMs ?? 10_000;
     this.maxDelayMs = config.maxDelayMs ?? 15 * 60 * 1000;
     this.defaultMaxAttempts = config.defaultMaxAttempts ?? 5;
+    this.leaseMs = config.leaseMs ?? 5 * 60 * 1000;
+    this.deadRetentionDays = config.deadRetentionDays ?? 14;
+    this.maxTasks = config.maxTasks ?? 500;
 
     ctx.storage.registerStore<RetryQueueStore>({
       name: STORE_KEY,
@@ -125,10 +229,18 @@ export class RetryQueueService extends Service {
 
     this.registerHandler('update_deal', async (payload) => {
       const dealId = String(payload.dealId ?? '');
-      const status = String(payload.status ?? '') as ItemDealStatuses;
-      if (!dealId || !status) {
+      const rawStatus = String(payload.status ?? '');
+      if (!dealId || !rawStatus) {
         throw new Error('update_deal: отсутствует dealId или status');
       }
+      // A status outside ItemDealStatuses can never become valid on a retry: dead-letter it
+      // immediately with the offending value instead of casting garbage into the API call.
+      if (!isItemDealStatus(rawStatus)) {
+        throw new PermanentTaskError(
+          `update_deal: недопустимый статус сделки «${rawStatus}» (допустимо: ${ITEM_DEAL_STATUS_VALUES.join(', ')})`,
+        );
+      }
+      const status = rawStatus;
       await this.ctx.playerok.updateDeal(dealId, status);
       if (status === ItemDealStatuses.SENT) {
         this.ctx.storage.markDealCompleted(dealId);
@@ -163,20 +275,38 @@ export class RetryQueueService extends Service {
     };
   }
 
-  public list(status?: 'pending' | 'dead'): RetryTask[] {
+  public list(status?: RetryTaskStatus): RetryTask[] {
     const tasks = this.ctx.storage.get<RetryQueueStore>(STORE_KEY).tasks;
     return status ? tasks.filter((t) => t.status === status) : [...tasks];
   }
 
-  public getStats(): RetryQueueStats {
+  /**
+   * Queue composition. The default call keeps the legacy three-field shape (`pending` counts
+   * every task that is not dead, leased ones included); `getStats(true)` additionally breaks
+   * out the leased subset and reports the retention counters for monitoring.
+   */
+  public getStats(detailed = false): RetryQueueStats {
     const tasks = this.list();
-    let pending = 0;
     let dead = 0;
+    let processing = 0;
     for (const t of tasks) {
       if (t.status === 'dead') dead += 1;
-      else pending += 1;
+      else if (t.status === 'processing') processing += 1;
     }
-    return { pending, dead, total: tasks.length };
+
+    const stats: RetryQueueStats = {
+      pending: tasks.length - dead,
+      dead,
+      total: tasks.length,
+    };
+
+    if (detailed) {
+      stats.processing = processing;
+      stats.expiredLeases = this.expiredLeases;
+      stats.pruned = this.prunedTasks;
+    }
+
+    return stats;
   }
 
   public async enqueue(options: EnqueueTaskOptions, now: Date = new Date()): Promise<RetryTask> {
@@ -221,13 +351,19 @@ export class RetryQueueService extends Service {
     return task;
   }
 
-  public async processDue(now: Date = new Date()): Promise<{ succeeded: number; rescheduled: number; deadLettered: number }> {
-    const dueIds = this.list('pending')
-      .filter((t) => {
-        const runMs = Date.parse(t.nextRunAt);
-        return Number.isNaN(runMs) || runMs <= now.getTime();
-      })
-      .map((t) => t.id);
+  /**
+   * Runs every due task: 'pending' tasks whose nextRunAt has passed, plus 'processing'
+   * tasks whose lease expired (their owner died mid-run, e.g. a crash or a restart).
+   *
+   * Each task is claimed atomically (pending -> processing, stamped with claimedAt/claimedBy)
+   * BEFORE its handler is invoked, so overlapping passes - including a second process sharing
+   * the same data directory - cannot execute the same task twice. The in-flight Set remains as
+   * a cheap in-process fast path that skips the storage round-trip for overlapping passes.
+   */
+  public async processDue(now: Date = new Date()): Promise<ProcessDueResult> {
+    const dueIds = this.list()
+      .filter((task) => this.isDue(task, now))
+      .map((task) => task.id);
 
     let succeeded = 0;
     let rescheduled = 0;
@@ -241,8 +377,17 @@ export class RetryQueueService extends Service {
 
       this.inFlight.add(id);
       try {
-        const task = this.list('pending').find((t) => t.id === id);
-        if (!task) continue;
+        const claim = await this.claimTask(id, now);
+        if (!claim.task) continue;
+        const task = claim.task;
+
+        if (claim.reclaimedLease) {
+          this.expiredLeases += 1;
+          this.log.warn(
+            `Задача [${task.kind}] #${task.id}: просроченная аренда (${claim.previousClaimedBy ?? 'владелец неизвестен'}) возвращена в обработку`,
+          );
+          await this.ctx.parallel('retry/lease-reclaimed', task);
+        }
 
         const handler = this.handlers.get(task.kind);
         if (!handler) {
@@ -267,7 +412,14 @@ export class RetryQueueService extends Service {
           await this.ctx.parallel('retry/succeeded', task);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
-          const becameDead = await this.markFailed(id, message, now, false);
+          // A PermanentTaskError means the payload itself is invalid: retrying cannot help,
+          // so the task goes to the DLQ at once and the DLQ message carries the reason.
+          const becameDead = await this.markFailed(
+            id,
+            message,
+            now,
+            err instanceof PermanentTaskError,
+          );
           if (becameDead) deadLettered += 1;
           else rescheduled += 1;
         }
@@ -276,7 +428,133 @@ export class RetryQueueService extends Service {
       }
     }
 
+    // Retention runs once per poll pass (never on enqueue): the enqueue path stays cheap and
+    // the clock is the pass's own now, which keeps tests deterministic.
+    const pruned = await this.prune(now);
+    if (pruned > 0) {
+      this.prunedTasks += pruned;
+      this.log.info(`Очередь повторов: удалено задач по политике хранения — ${pruned}`);
+    }
+
     return { succeeded, rescheduled, deadLettered };
+  }
+
+  private isDue(task: RetryTask, now: Date): boolean {
+    if (task.status === 'processing') return this.isLeaseExpired(task, now);
+    if (task.status !== 'pending') return false;
+    const runMs = Date.parse(task.nextRunAt);
+    return Number.isNaN(runMs) || runMs <= now.getTime();
+  }
+
+  /**
+   * A lease is expired once it is older than leaseMs. A record without a parseable claimedAt
+   * counts as expired on purpose: a half-written claim must not park a task forever.
+   */
+  private isLeaseExpired(task: RetryTask, now: Date): boolean {
+    const claimedMs = task.claimedAt ? Date.parse(task.claimedAt) : Number.NaN;
+    if (Number.isNaN(claimedMs)) return true;
+    return now.getTime() - claimedMs >= this.leaseMs;
+  }
+
+  /**
+   * Atomically moves one task into the 'processing' state.
+   *
+   * The read-modify-write body is fully synchronous, so a competing claim re-reads the file
+   * after the winner's write and sees status 'processing' with a fresh lease: the loser gets
+   * task null and never touches the handler.
+   */
+  private async claimTask(taskId: string, now: Date): Promise<ClaimOutcome> {
+    let outcome: ClaimOutcome = { task: null, reclaimedLease: false };
+
+    await this.ctx.storage.runExclusive(STORE_KEY, () => {
+      const store = this.ctx.storage.get<RetryQueueStore>(STORE_KEY);
+      const target = store.tasks.find((t) => t.id === taskId);
+      if (!target) return;
+
+      let reclaimedLease = false;
+      if (target.status === 'processing') {
+        if (!this.isLeaseExpired(target, now)) return;
+        reclaimedLease = true;
+      } else if (target.status !== 'pending') {
+        return;
+      }
+
+      const previousClaimedBy = target.claimedBy;
+      target.status = 'processing';
+      target.claimedAt = now.toISOString();
+      target.claimedBy = this.workerId;
+      this.ctx.storage.set<RetryQueueStore>(STORE_KEY, store);
+
+      outcome = { task: structuredClone(target), reclaimedLease, previousClaimedBy };
+    });
+
+    return outcome;
+  }
+
+  /**
+   * Retention policy, executed by every poll pass:
+   * 1) dead tasks whose DLQ entry is older than deadRetentionDays are removed;
+   * 2) while the store holds more than maxTasks entries, the oldest dead tasks are removed.
+   *
+   * Pending and processing work is never pruned: silently dropping it would lose a side
+   * effect this queue exists to guarantee.
+   */
+  private async prune(now: Date): Promise<number> {
+    let removed = 0;
+
+    await this.ctx.storage.runExclusive(STORE_KEY, () => {
+      const store = this.ctx.storage.get<RetryQueueStore>(STORE_KEY);
+      const cutoffMs = now.getTime() - this.deadRetentionDays * 24 * 60 * 60 * 1000;
+
+      const kept: RetryTask[] = [];
+      for (const task of store.tasks) {
+        if (task.status === 'dead' && this.deadTaskTimestamp(task) < cutoffMs) {
+          removed += 1;
+          continue;
+        }
+        kept.push(task);
+      }
+
+      if (kept.length > this.maxTasks) {
+        const deadEntries = kept
+          .map((task, index) => ({
+            index,
+            timestamp: this.deadTaskTimestamp(task),
+            isDead: task.status === 'dead',
+          }))
+          .filter((entry) => entry.isDead)
+          .sort((a, b) => a.timestamp - b.timestamp);
+
+        const dropped = new Set<number>();
+        for (const entry of deadEntries) {
+          if (kept.length - dropped.size <= this.maxTasks) break;
+          dropped.add(entry.index);
+        }
+
+        if (dropped.size > 0) {
+          const survivors = kept.filter((_, index) => !dropped.has(index));
+          kept.length = 0;
+          kept.push(...survivors);
+          removed += dropped.size;
+        }
+      }
+
+      if (removed > 0) {
+        store.tasks = kept;
+        this.ctx.storage.set<RetryQueueStore>(STORE_KEY, store);
+      }
+    });
+
+    return removed;
+  }
+
+  /** When the task landed in the DLQ, falling back to schedule/creation for legacy records. */
+  private deadTaskTimestamp(task: RetryTask): number {
+    for (const iso of [task.deadAt, task.nextRunAt, task.createdAt]) {
+      const ms = iso ? Date.parse(iso) : Number.NaN;
+      if (!Number.isNaN(ms)) return ms;
+    }
+    return 0;
   }
 
   private async markFailed(
@@ -294,11 +572,17 @@ export class RetryQueueService extends Service {
 
       target.attempts += 1;
       target.lastError = errorMessage;
+      // The attempt is over, so its lease is released: the next pass must be able to claim
+      // the task again (the in-flight Set is per-process and disappears with the process).
+      target.status = 'pending';
+      target.claimedAt = undefined;
+      target.claimedBy = undefined;
 
       if (forceDead || target.attempts >= target.maxAttempts) {
         target.status = 'dead';
+        target.deadAt = now.toISOString();
       } else {
-        const backoff = computeBackoffMs(target.attempts, this.baseDelayMs, this.maxDelayMs);
+        const backoff = nextDelay(target.attempts, this.baseDelayMs, this.maxDelayMs);
         target.nextRunAt = new Date(now.getTime() + backoff).toISOString();
       }
 
@@ -342,6 +626,9 @@ export class RetryQueueService extends Service {
       target.status = 'pending';
       target.attempts = 0;
       target.nextRunAt = now.toISOString();
+      target.claimedAt = undefined;
+      target.claimedBy = undefined;
+      target.deadAt = undefined;
       this.ctx.storage.set<RetryQueueStore>(STORE_KEY, store);
       return true;
     });
@@ -356,6 +643,9 @@ export class RetryQueueService extends Service {
           task.status = 'pending';
           task.attempts = 0;
           task.nextRunAt = now.toISOString();
+          task.claimedAt = undefined;
+          task.claimedBy = undefined;
+          task.deadAt = undefined;
           count += 1;
         }
       }
@@ -405,5 +695,7 @@ declare module 'cordis' {
     'retry/succeeded'(task: RetryTask): void | Promise<void>;
     /** @mode parallel */
     'retry/dead-letter'(task: RetryTask): void | Promise<void>;
+    /** @mode parallel */
+    'retry/lease-reclaimed'(task: RetryTask): void | Promise<void>;
   }
 }
