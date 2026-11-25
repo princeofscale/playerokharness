@@ -14,6 +14,7 @@ import {
 } from '@pkh/core';
 import '@pkh/adapter';
 import '@pkh/plugin-retry-queue';
+import { announceSafely, notifySafely } from '../notify.js';
 
 export interface TrackedPosition {
   name: string;
@@ -92,12 +93,20 @@ export class AutoBumpService extends Service {
         const msg = bumpErr instanceof Error ? bumpErr.message : String(bumpErr);
         const retryQueue = this.ctx.get('retryQueue', false);
         if (retryQueue) {
-          await retryQueue.enqueue({
-            kind: 'bump_item',
-            payload: { itemId: item.id, priorityStatusId: prem.id },
-            dedupeKey: `bump:${item.id}`,
-            error: msg,
-          });
+          try {
+            await retryQueue.enqueue({
+              kind: 'bump_item',
+              payload: { itemId: item.id, priorityStatusId: prem.id },
+              dedupeKey: `bump:${item.id}`,
+              error: msg,
+            });
+          } catch (enqueueErr) {
+            // Keep the API error as the reported one: replacing it with the queue error
+            // would hide why the bump actually failed.
+            this.log.error(
+              `Не удалось поставить поднятие «${item.name}» в очередь повторов: ${enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr)}`,
+            );
+          }
         }
         throw bumpErr;
       }
@@ -110,7 +119,7 @@ export class AutoBumpService extends Service {
         `«${item.name}» поднят${reason ? ` (${reason})` : ''}. Позиция: ${item.sequence ?? '?'} -> 1`,
       );
 
-      await this.ctx.parallel('item/bumped', {
+      await announceSafely(this.ctx, 'item/bumped', {
         itemId: item.id,
         slug: item.slug,
         name: item.name,
@@ -121,7 +130,7 @@ export class AutoBumpService extends Service {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.log.error(`Ошибка поднятия товара «${itemOrProfile.name}»: ${msg}`);
-      await this.ctx.parallel('notify/log', {
+      await notifySafely(this.ctx, {
         eventKey: 'item_bumped',
         title: `❌ Ошибка при поднятии товара «${itemOrProfile.name}»`,
         body: `<blockquote>${msg}</blockquote>`,

@@ -110,6 +110,7 @@ export function readJsonSafe<T>(
   schema: z.ZodType<T>,
   defaultValue: () => T,
   restoreMissing: boolean,
+  onRecover?: (reason: string) => void,
 ): T {
   const dir = path.dirname(filePath);
   fs.mkdirSync(dir, { recursive: true });
@@ -128,7 +129,12 @@ export function readJsonSafe<T>(
         }
         return result.data;
       }
-    } catch {
+      const firstIssue = result.error.issues[0];
+      onRecover?.(
+        `схема не совпала: ${firstIssue ? `${firstIssue.path.join('.') || '<root>'}: ${firstIssue.message}` : 'unknown'}`, 
+      );
+    } catch (err) {
+      onRecover?.(`некорректный JSON: ${err instanceof Error ? err.message : String(err)}`);
       // Fall through to backup & restore
     }
 
@@ -211,6 +217,7 @@ export class StorageService extends Service {
   public readonly baseDir: string;
   private readonly specs: Map<string, StoreSpec<unknown>> = new Map();
   private readonly queues: Map<string, Promise<unknown>> = new Map();
+  private readonly recoveredStores = new Set<string>();
 
   constructor(ctx: Context, config: StorageConfig) {
     super(ctx, 'storage');
@@ -429,7 +436,22 @@ export class StorageService extends Service {
       spec.schema as z.ZodType<T>,
       spec.defaultValue as () => T,
       spec.restoreMissing,
+      (reason) => this.reportRecovery(name, reason),
     );
+  }
+
+  /**
+   * A corrupt or schema-mismatched store used to be replaced with defaults silently:
+   * the operator saw empty settings and no explanation. Report the first recovery per
+   * store to the log and to the boot report (the .bak copy still holds the old file).
+   */
+  private reportRecovery(storeName: string, reason: string): void {
+    if (this.recoveredStores.has(storeName)) return;
+    this.recoveredStores.add(storeName);
+    this.ctx
+      .logger('storage')
+      .warn(`Хранилище «${storeName}» восстановлено значениями по умолчанию (${reason}); старая копия — ${storeName}.bak`);
+    this.ctx.get('bootReport', false)?.addError(storeName, 'recover', reason);
   }
 
   public set<T>(name: string, value: T): T {

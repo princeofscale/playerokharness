@@ -376,7 +376,7 @@ export class PlayerokService extends Service {
     return null;
   }
 
-  public async getMyItems(params: GetMyItemsParams = {}): Promise<ItemProfile[]> {
+  public async getMyItems(params: GetMyItemsParams = {}): Promise<MyItem[]> {
     const statuses = params.statuses ?? [ItemStatuses.APPROVED];
     const requestedCount = params.count ?? -1;
     const result: ItemProfile[] = [];

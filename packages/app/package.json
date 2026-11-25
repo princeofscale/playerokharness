@@ -14,6 +14,7 @@
   "dependencies": {
     "@pkh/core": "workspace:*",
     "@pkh/adapter": "workspace:*",
+    "@pkh/plugin-analytics": "workspace:*",
     "@pkh/plugin-automation": "workspace:*",
     "@pkh/plugin-retry-queue": "workspace:*",
     "@pkh/plugin-telegram": "workspace:*",

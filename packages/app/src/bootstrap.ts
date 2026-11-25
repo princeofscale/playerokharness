@@ -19,6 +19,7 @@ import {
   type MockTransportSeed,
   type PlayerokTransport,
 } from '@pkh/adapter';
+import { AnalyticsService } from '@pkh/plugin-analytics';
 import { mountAutomation } from '@pkh/plugin-automation';
 import { RetryQueueService } from '@pkh/plugin-retry-queue';
 import { TelegramService } from '@pkh/plugin-telegram';
@@ -109,6 +110,9 @@ export async function createApplication(options: AppOptions = {}): Promise<Playe
   mountAutomation(ctx, {
     enableTimers: options.enableTimers ?? true,
   });
+
+  // Root-mounted so the Telegram panel and the web dashboard can read it via ctx.get().
+  await ctx.use(AnalyticsService, { enableBackfill: options.enableTimers !== false });
 
   const webEnabled = options.enableWeb ?? isTruthyEnv(process.env.PKH_WEB_ENABLED);
   // The dashboard binds inside an effect, which cordis does not await; `ready` keeps

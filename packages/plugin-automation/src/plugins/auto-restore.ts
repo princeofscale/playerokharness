@@ -15,6 +15,7 @@ import {
 } from '@pkh/core';
 import '@pkh/adapter';
 import '@pkh/plugin-retry-queue';
+import { announceSafely, notifySafely } from '../notify.js';
 
 export interface AutoRestoreConfig {
   expiredCheckIntervalMs?: number;
@@ -65,6 +66,9 @@ export class AutoRestoreService extends Service {
               this.log.debug(
                 `Товар «${fetched.name}» уже не в статусе SOLD (${String(fetched.status)}) — восстановление не требуется`,
               );
+              // The id resolved, so this is a definitive answer: the page scan below matches
+              // by name and could publish a *different* listing that shares the name.
+              return;
             }
           } catch (err) {
             this.log.warn(
@@ -329,7 +333,7 @@ export class AutoRestoreService extends Service {
         `Товар «${item.name}» ${shouldRecreate ? 'пересоздан' : 'восстановлен'} (${premResult ? 'премиум' : 'бесплатный'})`,
       );
 
-      await this.ctx.parallel('item/restored', {
+      await announceSafely(this.ctx, 'item/restored', {
         itemId: newItem.id,
         oldItemId: shouldRecreate ? item.id : undefined,
         slug: newItem.slug || item.slug,
@@ -343,7 +347,7 @@ export class AutoRestoreService extends Service {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.log.error(`Ошибка при восстановлении товара «${itemOrProfile.name}»: ${message}`);
-      await this.ctx.parallel('notify/log', {
+      await notifySafely(this.ctx, {
         eventKey: 'item_restored',
         title: `❌ Ошибка при восстановлении товара «${itemOrProfile.name}»`,
         body: `<blockquote>${message}</blockquote>`,

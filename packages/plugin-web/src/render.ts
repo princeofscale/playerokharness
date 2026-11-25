@@ -6,6 +6,13 @@
  * name can never break out of the markup.
  */
 
+import {
+  ANALYTICS_TOP_ITEMS,
+  type AnalyticsItemView,
+  type AnalyticsTotals,
+  type AnalyticsView,
+} from './analytics.js';
+
 export interface AccountView {
   id: string;
   username: string;
@@ -60,6 +67,7 @@ export interface OverviewView {
 
 const NAV = [
   { href: '/', label: 'Обзор', key: 'overview' },
+  { href: '/analytics', label: 'Аналитика', key: 'analytics' },
   { href: '/deals', label: 'Сделки', key: 'deals' },
   { href: '/queue', label: 'Очередь', key: 'queue' },
   { href: '/logs', label: 'Логи', key: 'logs' },
@@ -104,6 +112,18 @@ const STYLE = `
   pre { margin: 0; overflow-x: auto; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
   footer { padding: 10px 20px 24px; color: #6b7280; font-size: 12px; }
   ul { margin: 0; padding-left: 18px; }
+  ul.bars { list-style: none; padding-left: 0; }
+  ul.bars li {
+    display: grid;
+    grid-template-columns: minmax(140px, 1.4fr) minmax(90px, 2fr) max-content;
+    gap: 10px;
+    align-items: center;
+    padding: 5px 0;
+  }
+  .bar-label { overflow-wrap: anywhere; }
+  .bar-track { display: block; height: 9px; background: #1d2330; border-radius: 5px; overflow: hidden; }
+  .bar-fill { display: block; height: 100%; background: linear-gradient(90deg, #38bdf8, #7dd3fc); }
+  .bar-value { color: #9aa4b2; white-space: nowrap; }
 `;
 
 export function escapeHtml(value: unknown): string {
@@ -180,6 +200,8 @@ ${cards}
 <section class="card"><h2>Ошибки при запуске</h2>${errors}</section>
 <section class="card"><h2>JSON API</h2><ul>
   <li><code>/api/status</code> — сводка</li>
+  <li><code>/analytics</code> — аналитика выручки</li>
+  <li><code>/api/analytics</code> — аналитика выручки в JSON</li>
   <li><code>/api/deals</code> — кэш сделок</li>
   <li><code>/api/queue</code> — очередь повторов</li>
   <li><code>/events</code> — поток Server-Sent Events</li>
@@ -199,6 +221,82 @@ function renderAccount(account: AccountView | null, error: string | null): strin
   <dt>Роль</dt><dd>${escapeHtml(account.role ?? '—')}</dd>
   <dt>Блокировка</dt><dd>${account.isBlocked ? 'да' : 'нет'}</dd>
 </dl>`;
+}
+
+/** Money for the dashboard: two decimals, or "нет данных" when the value is missing. */
+function formatMoney(value: number): string {
+  return Number.isFinite(value) ? `${value.toFixed(2)} ₽` : 'нет данных';
+}
+
+function formatAverage(totals: AnalyticsTotals): string {
+  return totals.averageOrderValue === null ? 'нет данных' : formatMoney(totals.averageOrderValue);
+}
+
+function renderTopItems(items: AnalyticsItemView[]): string {
+  const peak = items.reduce(
+    (max, item) => (Number.isFinite(item.revenue) ? Math.max(max, item.revenue) : max),
+    0,
+  );
+
+  const rows = items
+    .map((item) => {
+      // The bar is a share of the revenue leader, clamped so the markup is always valid CSS.
+      const ratio = peak > 0 && item.revenue > 0 ? Math.round((item.revenue / peak) * 100) : 0;
+      const width = ratio > 0 ? Math.max(2, Math.min(100, ratio)) : 0;
+      return `<li>
+  <span class="bar-label">${escapeHtml(item.itemName)} <span class="muted">${escapeHtml(item.itemId)}</span></span>
+  <span class="bar-track"><span class="bar-fill" style="width:${width}%"></span></span>
+  <span class="bar-value">${escapeHtml(formatMoney(item.revenue))} · ${escapeHtml(item.orders)}</span>
+</li>`;
+    })
+    .join('');
+
+  return `<ul class="bars">${rows}</ul>`;
+}
+
+export function renderAnalytics(view: AnalyticsView): string {
+  const periods: Array<{ label: string; totals: AnalyticsTotals }> = [
+    { label: 'Сегодня', totals: view.today },
+    { label: 'Последние 7 дней', totals: view.last7Days },
+    { label: 'Последние 30 дней', totals: view.last30Days },
+    { label: 'Всё время', totals: view.allTime },
+  ];
+
+  const table = `<table>
+  <thead><tr><th>Период</th><th class="num">Выручка, ₽</th><th class="num">Заказов</th><th class="num">Средний чек</th></tr></thead>
+  <tbody>${periods
+    .map(
+      (period) => `<tr>
+  <td>${escapeHtml(period.label)}</td>
+  <td class="num">${escapeHtml(formatMoney(period.totals.revenue))}</td>
+  <td class="num">${period.totals.orders}</td>
+  <td class="num">${escapeHtml(formatAverage(period.totals))}</td>
+</tr>`,
+    )
+    .join('')}</tbody>
+</table>`;
+
+  const emptyHint =
+    view.cachedOrders === 0 ? '<p class="muted">Кэш сделок пуст — нет данных для аналитики</p>' : '';
+  const bars =
+    view.topItems.length === 0
+      ? '<p class="muted">нет данных</p>'
+      : renderTopItems(view.topItems);
+
+  return layout(
+    'Аналитика',
+    'analytics',
+    `<section class="card">
+  <h2>Выручка по периодам</h2>
+  ${emptyHint}
+  ${table}
+  <p class="muted">Записей в кэше сделок: ${view.cachedOrders} · снимок ${escapeHtml(view.generatedAt)}</p>
+</section>
+<section class="card">
+  <h2>Топ-${ANALYTICS_TOP_ITEMS} товаров по выручке · всё время</h2>
+  ${bars}
+</section>`,
+  );
 }
 
 export function renderDeals(data: { total: number; deals: DealView[] }): string {

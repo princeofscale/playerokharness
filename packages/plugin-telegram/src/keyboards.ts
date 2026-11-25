@@ -617,7 +617,11 @@ export function renderProfile(account: AccountInfo | null): RenderedView {
   };
 }
 
-export function renderStats(orders: CachedOrders, period: StatsPeriod): RenderedView {
+export function renderStats(
+  orders: CachedOrders,
+  period: StatsPeriod,
+  topItems: Array<{ name: string; qty: number; revenue: number }> = [],
+): RenderedView {
   const s = computeOrdersStats(orders, period);
   const titles: Record<StatsPeriod, string> = {
     day: 'за 24 часа',
@@ -625,7 +629,7 @@ export function renderStats(orders: CachedOrders, period: StatsPeriod): Rendered
     month: 'за 30 дней',
     all: 'за всё время',
   };
-  const text = [
+  const lines = [
     `<b>📊 Статистика продаж (${titles[period]})</b>`,
     '',
     `Всего сделок: <b>${s.totalDeals}</b>`,
@@ -633,7 +637,18 @@ export function renderStats(orders: CachedOrders, period: StatsPeriod): Rendered
     `• В процессе: <b>${s.pendingDeals}</b>`,
     `• Возвратов: <b>${s.refundedDeals}</b> (${s.refundedAmount}₽)`,
     `Общий оборот: <b>${s.grossAmount}₽</b>`,
-  ].join('\n');
+  ];
+
+  if (topItems.length > 0) {
+    lines.push('', '<b>🏆 Топ товаров:</b>');
+    topItems.forEach((item, index) => {
+      lines.push(
+        `${index + 1}. ${escapeHtml(item.name)} — ${item.qty} шт · <b>${item.revenue}₽</b>`,
+      );
+    });
+  }
+
+  const text = lines.join('\n');
 
   const kb = new InlineKeyboard()
     .text(period === 'day' ? '• 24ч •' : '24ч', 'stats:day')
@@ -871,11 +886,14 @@ export function renderConfigsMenu(baseDir: string): RenderedView {
 export function renderRetryQueue(tasks: RetryTask[]): RenderedView {
   const pending = tasks.filter((t) => t.status === 'pending');
   const dead = tasks.filter((t) => t.status === 'dead');
+  // A leased task is 'processing': it must be counted, otherwise the queue looks empty
+  // exactly while the bot is busy retrying.
+  const processing = tasks.filter((t) => t.status === 'processing');
 
   const lines: string[] = [
     '<b>🔁 Очередь повторов и Dead-Letter Queue</b>',
     '',
-    `В ожидании (pending): <b>${pending.length}</b> | Dead-Letter (DLQ): <b>${dead.length}</b>`,
+    `В ожидании (pending): <b>${pending.length}</b>${processing.length > 0 ? ` | выполняется: <b>${processing.length}</b>` : ''} | Dead-Letter (DLQ): <b>${dead.length}</b>`,
   ];
 
   if (tasks.length === 0) {
@@ -883,7 +901,7 @@ export function renderRetryQueue(tasks: RetryTask[]): RenderedView {
   } else {
     lines.push('');
     for (const task of tasks.slice(0, 10)) {
-      const icon = task.status === 'dead' ? '☠️' : '⏳';
+      const icon = task.status === 'dead' ? '☠️' : task.status === 'processing' ? '⚙️' : '⏳';
       const errPreview = task.lastError ? ` — ${escapeHtml(task.lastError.slice(0, 70))}` : '';
       lines.push(
         `${icon} <code>${escapeHtml(task.id)}</code> · <b>${escapeHtml(task.kind)}</b> (${task.attempts}/${task.maxAttempts})${errPreview}`,

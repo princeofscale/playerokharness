@@ -127,26 +127,68 @@ export class LogSinkService extends Service {
     }
   }
 
+  /** Number of rotated files kept next to the live log (latest.log.1, latest.log.2). */
+  public static readonly ARCHIVES = 2;
+
   public enforceMaxFileSize(): void {
     try {
       if (!fs.existsSync(this.logFilePath)) return;
       const stats = fs.statSync(this.logFilePath);
       const sizeMb = stats.size / (1024 * 1024);
       const maxMb = this.ctx.storage.getConfig().logs.max_file_size;
-      if (sizeMb > maxMb) {
-        fs.writeFileSync(this.logFilePath, '', 'utf8');
+      if (sizeMb > maxMb) this.rotate();
+    } catch {
+      // ignore
+    }
+  }
+
+  /**
+   * Rotates latest.log -> latest.log.1 (shifting older archives) instead of truncating.
+   * The old behaviour destroyed the whole log right before the moment an operator
+   * needs it — the crash evidence was deleted by the cleanup itself.
+   */
+  public rotate(): void {
+    try {
+      for (let index = LogSinkService.ARCHIVES; index >= 1; index -= 1) {
+        const source = index === 1 ? this.logFilePath : `${this.logFilePath}.${index - 1}`;
+        const target = `${this.logFilePath}.${index}`;
+        if (!fs.existsSync(source)) continue;
+        fs.renameSync(source, target);
       }
+      fs.writeFileSync(this.logFilePath, '', 'utf8');
     } catch {
       // ignore
     }
   }
 
   public getRecentLines(limit = 50): string[] {
+    return this.readTailLines(limit).slice(-limit);
+  }
+
+  /**
+   * Reads only the tail of the log instead of the whole file: the size guard allows
+   * multi-megabyte logs, and the Telegram panel asks for 40 lines on every refresh.
+   */
+  private readTailLines(limit: number): string[] {
+    const maxTailBytes = Math.max(64 * 1024, limit * 512);
     try {
       if (!fs.existsSync(this.logFilePath)) return [];
-      const content = fs.readFileSync(this.logFilePath, 'utf8');
-      const lines = content.split('\n').filter(Boolean);
-      return lines.slice(-limit);
+      const fd = fs.openSync(this.logFilePath, 'r');
+      try {
+        const size = fs.fstatSync(fd).size;
+        const start = Math.max(0, size - maxTailBytes);
+        const length = size - start;
+        if (length <= 0) return [];
+        const buffer = Buffer.alloc(length);
+        fs.readSync(fd, buffer, 0, length, start);
+        const text = buffer.toString('utf8');
+        const lines = text.split('\n');
+        // Drop a possibly half-read first line when the tail did not start at offset 0.
+        if (start > 0) lines.shift();
+        return lines.filter(Boolean);
+      } finally {
+        fs.closeSync(fd);
+      }
     } catch {
       return [];
     }

@@ -8,7 +8,6 @@ import type {
   ItemDealDirections,
   ItemDealStatuses,
   ItemPriorityStatus,
-  ItemProfile,
   ItemStatuses,
   MyItem,
   PaginatedList,
@@ -97,7 +96,7 @@ export interface PlayerokTransport {
   sendMessage(params: SendMessageParams): Promise<ChatMessage>;
   downloadFile(url: string): Promise<Buffer>;
 
-  getMyItems(params?: GetMyItemsParams): Promise<PaginatedList<ItemProfile>>;
+  getMyItems(params?: GetMyItemsParams): Promise<PaginatedList<MyItem>>;
   getItem(ref: { id?: string; slug?: string }): Promise<MyItem>;
   getItemPriorityStatuses(itemId: string, rawPrice: number): Promise<ItemPriorityStatus[]>;
   increaseItemPriorityStatus(itemId: string, priorityStatusId: string): Promise<MyItem>;

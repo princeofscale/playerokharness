@@ -173,8 +173,45 @@ async function runDoctor(dataDir: string): Promise<void> {
   for (const [label, ok, detail] of checks) {
     console.log(`  ${ok ? '✅' : '⚠️'} ${label}: ${detail}`);
   }
+
+  // Operational state that an operator needs before a restart, read without booting.
+  const queue = readQueueStats(dataDir);
+  if (queue) {
+    console.log(
+      `  ${queue.dead > 0 ? '⚠️' : '✅'} Очередь повторов: ожидает ${queue.pending}, в Dead-Letter ${queue.dead}`,
+    );
+  }
+  const markers = ctx.storage.get<{ action?: string }>('boot_marker');
+  if (markers?.action) {
+    console.log(`  ⚠️ Boot-маркер: «${markers.action}» (прошлый запуск не завершился штатно)`);
+  }
+  const webPort = process.env.PKH_WEB_PORT ?? '8787';
+  const webOn = ['1', 'true', 'yes', 'on'].includes((process.env.PKH_WEB_ENABLED ?? '').toLowerCase());
+  const webToken = Boolean(process.env.PKH_WEB_TOKEN);
+  console.log(
+    `  ${webOn ? '✅' : '⚠️'} Веб-панель: ${webOn ? `включена (порт ${webPort})` : 'выключена (--web или PKH_WEB_ENABLED=true)'}${webOn && !webToken ? ' — токен не задан, только loopback' : ''}`,
+  );
   console.log('');
   await ctx.fiber.dispose();
+}
+
+/** Reads bot_data/retry_queue.json without booting the app (doctor must stay offline). */
+function readQueueStats(dataDir: string): { pending: number; dead: number } | null {
+  try {
+    const file = path.join(dataDir, 'bot_data', 'retry_queue.json');
+    if (!fs.existsSync(file)) return null;
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as {
+      tasks?: Array<{ status?: string }>;
+    };
+    const tasks = parsed.tasks ?? [];
+    let dead = 0;
+    for (const task of tasks) {
+      if (task.status === 'dead') dead += 1;
+    }
+    return { pending: tasks.length - dead, dead };
+  } catch {
+    return null;
+  }
 }
 
 function runPluginsList(dataDir: string, pluginsDir?: string): void {

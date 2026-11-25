@@ -215,11 +215,11 @@ export const dealNodeSchema = z.looseObject({
 export type DealNode = z.infer<typeof dealNodeSchema>;
 
 /**
- * Raw chat message node. `getChatMessages` and the WS subscription both consume it.
+ * Shared message shape. `getChatMessages` and the WS subscription both consume it.
  * The mapper reads `user`/`images`/`file`; `byUser`/`attachments` are the alternate
  * spellings PlayerOK ships elsewhere, accepted here so they are never false alarms.
  */
-export const chatMessageNodeSchema = z.looseObject({
+const chatMessageCommonShape = {
   id: z.string(),
   text: z.string().nullish(),
   createdAt: z.string(),
@@ -230,6 +230,19 @@ export const chatMessageNodeSchema = z.looseObject({
   attachments: z.array(fileNodeSchema).nullish(),
   file: fileNodeSchema.nullish(),
   deal: embeddedDealNodeSchema.nullish(),
+};
+
+export const chatMessageNodeSchema = z.looseObject(chatMessageCommonShape);
+
+/**
+ * `createChatMessage` response node. `mapMessage` runs directly on the mutation
+ * result and copies `text` straight through, so here the key must be present: a
+ * null text is legitimate for an image-only message, a missing one means the
+ * field was renamed and would otherwise degrade to an empty message silently.
+ */
+const sentMessageNodeSchema = z.looseObject({
+  ...chatMessageCommonShape,
+  text: z.string().nullable(),
 });
 
 export type ChatMessageNode = z.infer<typeof chatMessageNodeSchema>;
@@ -389,6 +402,62 @@ export const transactionsPayloadSchema = z.looseObject({
   }),
 });
 
+/*
+ * Mutation envelopes.
+ *
+ * Every mutation answers with the same node shape its query counterpart returns,
+ * and the transport maps that node immediately (`mapItem`/`mapDeal`/
+ * `mapMessage`/`mapTransaction`), so a renamed response key or a dropped consumed
+ * field used to degrade into ''/0/null with no signal. The envelope requires the
+ * operation key: `nullable()` (not `nullish()`) tolerates a null node - mapped
+ * best-effort - while a missing or renamed key is reported as a `ContractIssue`.
+ */
+
+/** `updateDeal` - the updated deal, mapped by `mapDeal`. */
+export const updateDealPayloadSchema = z.looseObject({
+  updateDeal: dealNodeSchema.nullable(),
+});
+
+/** `reportDealProblem` - the flagged deal; same node as `updateDeal`. */
+export const reportDealProblemPayloadSchema = z.looseObject({
+  reportDealProblem: dealNodeSchema.nullable(),
+});
+
+/** `publishItem` - the re-published item, mapped by `mapItem`. */
+export const publishItemPayloadSchema = z.looseObject({
+  publishItem: itemNodeSchema.nullable(),
+});
+
+/** `createItem` - the created item; same selected fields as `publishItem`. */
+export const createItemPayloadSchema = z.looseObject({
+  createItem: itemNodeSchema.nullable(),
+});
+
+/** `updateItem` - the edited item plus the `dataFields` `mapItem` copies. */
+export const updateItemPayloadSchema = z.looseObject({
+  updateItem: itemNodeSchema.nullable(),
+});
+
+/** `increaseItemPriorityStatus` - the bumped item. */
+export const increaseItemPriorityStatusPayloadSchema = z.looseObject({
+  increaseItemPriorityStatus: itemNodeSchema.nullable(),
+});
+
+/** `requestWithdrawal` - `mapTransaction` keys the created transaction on `id`. */
+export const requestWithdrawalPayloadSchema = z.looseObject({
+  requestWithdrawal: transactionNodeSchema.nullable(),
+});
+
+/** `removeTransaction` - the cancelled transaction. */
+export const removeTransactionPayloadSchema = z.looseObject({
+  removeTransaction: transactionNodeSchema.nullable(),
+});
+
+/** `createChatMessage` - the sent message echoed back and mapped by `mapMessage`. */
+export const createChatMessagePayloadSchema = z.looseObject({
+  createChatMessage: sentMessageNodeSchema.nullable(),
+});
+
 /**
  * WS `next` payload. Exactly one known subscription key is expected per frame;
  * if PlayerOK renames `chatMessageCreated` (or drops every key we know) the
@@ -414,3 +483,11 @@ export const wsNextPayloadSchema = z
   );
 
 export type WsNextPayload = z.infer<typeof wsNextPayloadSchema>;
+
+/**
+ * createChatMessage depends on the temporary-store upload: a null/renamed node there used
+ * to crash with "Cannot read properties of null (reading 'id')" inside sendMessage.
+ */
+export const uploadChatImagePayloadSchema = z.looseObject({
+  uploadChatImageIntoTemporaryStore: z.looseObject({ id: z.string() }).nullable(),
+});

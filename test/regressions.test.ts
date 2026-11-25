@@ -272,7 +272,7 @@ describe('Automation behaviour regressions (round 2)', () => {
     ]);
 
     // Force the "API refused the send" path, then make the queue write fail too.
-    mock.sendMessage = async () => null;
+    mock.sendMessage = (async () => null) as unknown as typeof mock.sendMessage;
     app.ctx.retryQueue.enqueue = async () => {
       throw new Error('queue store unavailable');
     };

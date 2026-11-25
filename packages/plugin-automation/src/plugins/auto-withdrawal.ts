@@ -6,6 +6,7 @@ import {
   TransactionProviderIds,
 } from '@pkh/core';
 import '@pkh/adapter';
+import { announceSafely, notifySafely } from '../notify.js';
 
 export interface AutoWithdrawalConfig {
   tickIntervalMs?: number;
@@ -87,7 +88,7 @@ export class AutoWithdrawalService extends Service {
       });
 
       this.log.info(`Создана заявка на вывод ${balance}₽ (ID: ${tx.id}, провайдер: ${provider})`);
-      await this.ctx.parallel('withdrawal/requested', {
+      await announceSafely(this.ctx, 'withdrawal/requested', {
         transactionId: tx.id,
         amount: balance,
         provider,
@@ -96,7 +97,7 @@ export class AutoWithdrawalService extends Service {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.log.error(`Ошибка авто-вывода (${balance}₽): ${message}`);
-      await this.ctx.parallel('notify/log', {
+      await notifySafely(this.ctx, {
         eventKey: 'withdrawal_requested',
         title: `❌ Ошибка при создании транзакции на вывод ${balance}₽`,
         body: `<blockquote>${message}</blockquote>`,

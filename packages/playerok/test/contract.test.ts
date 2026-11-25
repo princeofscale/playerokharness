@@ -3,7 +3,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { Context, PriorityTypes, StorageService } from '@pkh/core';
+import { Context, ItemDealStatuses, PriorityTypes, StorageService, TransactionProviderIds } from '@pkh/core';
 import {
   GraphQLPlayerokTransport,
   MAX_CONTRACT_ISSUES,
@@ -397,6 +397,175 @@ describe('GraphQL response-contract guard', () => {
     });
     expect(mockCtx.playerok.getContractIssues()).toEqual([]);
     await mockCtx.fiber.dispose();
+
+    await transport.close();
+  });
+});
+
+const validTransaction = {
+  id: 'trx-1',
+  operation: 'WITHDRAW',
+  direction: 'OUT',
+  providerId: 'SBP',
+  status: 'PENDING',
+  value: 500,
+  fee: 5,
+  createdAt: '2024-05-02T09:00:00.000Z',
+};
+
+/** Answers every guarded mutation with a realistically valid node for its operation. */
+function mutationHandlers(): Record<string, () => unknown> {
+  return {
+    createChatMessage: () => ({ createChatMessage: validMessage }),
+    createItem: () => ({ createItem: validItem }),
+    increaseItemPriorityStatus: () => ({ increaseItemPriorityStatus: validItem }),
+    publishItem: () => ({ publishItem: validItem }),
+    removeTransaction: () => ({ removeTransaction: validTransaction }),
+    reportDealProblem: () => ({ reportDealProblem: { ...validDeal, hasProblem: true } }),
+    requestWithdrawal: () => ({ requestWithdrawal: validTransaction }),
+    updateDeal: () => ({
+      updateDeal: { ...validDeal, status: 'CONFIRMED', completedAt: '2024-05-01T12:00:00.000Z' },
+    }),
+    updateItem: () => ({ updateItem: validItem }),
+  };
+}
+
+describe('GraphQL mutation response-contract guard', () => {
+  it('records no issue for valid mutation payloads and returns the same mapped object', async () => {
+    const srv = await createContractServer(mutationHandlers());
+    activeServers.push(srv);
+    const transport = makeTransport(srv);
+
+    const updated = await transport.updateDeal('deal-1', ItemDealStatuses.CONFIRMED);
+    expect(updated.id).toBe('deal-1');
+    expect(updated.status).toBe(ItemDealStatuses.CONFIRMED);
+    expect(updated.completedAt).toBe('2024-05-01T12:00:00.000Z');
+    expect(updated.item.name).toBe('Test Item');
+    expect(updated.review?.rating).toBe(5);
+
+    const problem = await transport.reportDealProblem('deal-1', 'Товар не получен', 'pt-1');
+    expect(problem.id).toBe('deal-1');
+    expect(problem.hasProblem).toBe(true);
+
+    const published = await transport.publishItem('it-1', 'ps-1');
+    expect(published.name).toBe('Test Item');
+    expect(published.rawPrice).toBe(280);
+    expect(published.priority).toBe(PriorityTypes.PREMIUM);
+
+    const created = await transport.createItem({
+      gameCategoryId: 'cat-1',
+      obtainingTypeId: 'ot-1',
+      name: 'Test Item',
+      price: 300,
+      description: 'Описание товара',
+    });
+    expect(created.id).toBe('it-1');
+    expect(created.sequence).toBe(3);
+
+    const edited = await transport.updateItem('it-1', { price: 350 });
+    expect(edited.name).toBe('Test Item');
+    expect(edited.dataFields?.[0]?.value).toBe('login-1');
+
+    const bumped = await transport.increaseItemPriorityStatus('it-1', 'ps-1');
+    expect(bumped.id).toBe('it-1');
+    expect(bumped.mayBePublished).toBe(true);
+
+    const withdrawal = await transport.requestWithdrawal({
+      provider: TransactionProviderIds.SBP,
+      account: 'acc-1',
+      value: 500,
+    });
+    expect(withdrawal.id).toBe('trx-1');
+    expect(withdrawal.value).toBe(500);
+    expect(withdrawal.operation).toBe('WITHDRAW');
+    expect(withdrawal.fee).toBe(5);
+
+    const cancelled = await transport.removeTransaction('trx-1');
+    expect(cancelled.id).toBe('trx-1');
+    expect(cancelled.account).toBeNull();
+
+    const sent = await transport.sendMessage({ chatId: 'chat-1', text: 'Здравствуйте!' });
+    expect(sent.id).toBe('msg-1');
+    expect(sent.text).toBe('Здравствуйте!');
+    expect(sent.images?.[0]?.url).toBe('https://playerok.com/1.jpg');
+
+    expect(transport.getContractIssues()).toEqual([]);
+    await transport.close();
+  });
+
+  it('records exactly one issue for a mutation payload missing a consumed field', async () => {
+    const srv = await createContractServer({
+      // The item still comes back, but `id` is gone - the shape a renamed field
+      // leaves behind once `mapItem` falls back to `String(x ?? '')`.
+      publishItem: () => ({
+        publishItem: { slug: 'slug-1', name: 'Test Item', price: 300, rawPrice: 280 },
+      }),
+    });
+    activeServers.push(srv);
+    const transport = makeTransport(srv);
+
+    const item = await transport.publishItem('it-1', 'ps-1');
+    expect(item.id).toBe('');
+    expect(item.slug).toBe('slug-1');
+    expect(item.name).toBe('Test Item');
+    expect(item.rawPrice).toBe(280);
+
+    const issues = transport.getContractIssues();
+    expect(issues).toHaveLength(1);
+    expect(issues[0].op).toBe('publishItem');
+    expect(issues[0].paths).toEqual(['publishItem.id']);
+    expect(issues[0].issueCount).toBe(1);
+    expect(issues[0].at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+
+    await transport.close();
+  });
+
+  it('does not throw when a mutation payload is completely wrong', async () => {
+    const srv = await createContractServer({
+      // Renamed response key: the node hides behind a different name.
+      removeTransaction: () => ({ transactionRemoved: validTransaction }),
+      // Null node: tolerated by the envelope, mapped best-effort.
+      requestWithdrawal: () => ({ requestWithdrawal: null }),
+      // Not even an object: reported as `(root)`, mapping still returns defaults.
+      publishItem: () => 'not-an-object',
+      // Node carrying only the fields the mapper cannot recover.
+      createChatMessage: () => ({ createChatMessage: { id: 'msg-9' } }),
+    });
+    activeServers.push(srv);
+    const transport = makeTransport(srv);
+
+    const removed = await transport.removeTransaction('trx-1');
+    expect(removed.id).toBe('');
+    expect(removed.value).toBe(0);
+
+    const withdrawal = await transport.requestWithdrawal({
+      provider: TransactionProviderIds.SBP,
+      account: 'acc-1',
+      value: 500,
+    });
+    expect(withdrawal.id).toBe('');
+    expect(withdrawal.value).toBe(0);
+
+    const item = await transport.publishItem('it-1', 'ps-1');
+    expect(item.id).toBe('');
+    expect(item.price).toBe(0);
+
+    const sent = await transport.sendMessage({ chatId: 'chat-1', text: 'hi' });
+    expect(sent.id).toBe('msg-9');
+    // `createdAt` is defaulted, never dropped: a broken payload still yields a message.
+    expect(sent.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+
+    const issues = transport.getContractIssues();
+    expect(issues.map((issue) => issue.op)).toEqual([
+      'removeTransaction',
+      'publishItem',
+      'createChatMessage',
+    ]);
+    expect(issues[0].paths).toEqual(['removeTransaction']);
+    // The envelope itself failed, so the node key is not even reachable.
+    expect(issues[1].paths).toEqual(['(root)']);
+    expect(issues[2].paths).toContain('createChatMessage.text');
+    expect(issues[2].issueCount).toBe(3);
 
     await transport.close();
   });

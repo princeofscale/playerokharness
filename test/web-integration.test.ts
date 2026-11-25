@@ -52,6 +52,36 @@ describe('createApplication web dashboard wiring', () => {
     expect(dashboard?.address).toBeNull();
   });
 
+  it('mounts analytics on the root context and records a real deal', async () => {
+    const app = await createApplication({
+      dataDir: makeTempDir(),
+      dryRun: true,
+      transport: new MockPlayerokTransport(),
+      enableTelegram: false,
+      enableTimers: false,
+      enableInstanceLock: false,
+      silentConsole: true,
+    });
+
+    const analytics = app.ctx.get('analytics', false);
+    expect(analytics).toBeTruthy();
+    await app.start();
+
+    const mock = app.ctx.playerok.transport as MockPlayerokTransport;
+    await mock.simulateNewDeal({
+      dealId: 'deal-analytics-app',
+      buyer: { id: 'buyer-app', username: 'buyer_app' },
+      itemId: '11111111-1111-1111-1111-111111111111',
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const summary = analytics!.getSummary({ period: 'day' });
+    expect(summary.orders).toBe(1);
+    expect(summary.revenue).toBeGreaterThan(0);
+
+    await app.stop();
+  });
+
   it('does not listen when enableWeb is not requested', async () => {
     const app = await createApplication({
       dataDir: makeTempDir(),

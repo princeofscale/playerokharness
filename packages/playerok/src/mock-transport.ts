@@ -19,7 +19,6 @@ import {
   type ChatMessage,
   type ItemDeal,
   type ItemPriorityStatus,
-  type ItemProfile,
   type MyItem,
   type PaginatedList,
   type PlayerokEvent,
@@ -280,7 +279,7 @@ export class MockPlayerokTransport implements PlayerokTransport {
     return Buffer.from('mock-image-bytes');
   }
 
-  public async getMyItems(params: GetMyItemsParams = {}): Promise<PaginatedList<ItemProfile>> {
+  public async getMyItems(params: GetMyItemsParams = {}): Promise<PaginatedList<MyItem>> {
     let list = Array.from(this.items.values());
     if (params.statuses && params.statuses.length > 0) {
       list = list.filter((it) => it.status && params.statuses!.includes(it.status));

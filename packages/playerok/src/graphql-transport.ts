@@ -24,7 +24,6 @@ import {
   type ItemDeal,
   type ItemDealDirections,
   type ItemPriorityStatus,
-  type ItemProfile,
   type MyItem,
   type PaginatedList,
   type PlayerokEvent,
@@ -45,13 +44,23 @@ import {
   chatMessagesPayloadSchema,
   chatPayloadSchema,
   chatsPayloadSchema,
+  createChatMessagePayloadSchema,
+  createItemPayloadSchema,
   dealPayloadSchema,
   dealsPayloadSchema,
+  increaseItemPriorityStatusPayloadSchema,
   itemPayloadSchema,
   itemPriorityStatusesPayloadSchema,
   itemsPayloadSchema,
+  publishItemPayloadSchema,
+  removeTransactionPayloadSchema,
+  reportDealProblemPayloadSchema,
+  requestWithdrawalPayloadSchema,
   reviewsPayloadSchema,
   transactionsPayloadSchema,
+  updateDealPayloadSchema,
+  updateItemPayloadSchema,
+  uploadChatImagePayloadSchema,
   userPayloadSchema,
   viewerPayloadSchema,
   wsNextPayloadSchema,
@@ -613,19 +622,32 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
   }
 
   private async uploadChatImage(chatId: string, file: BinaryUpload): Promise<string> {
-    const data = await this.postMultipart<{ uploadChatImageIntoTemporaryStore: { id: string } }>(
+    const data = this.guard(
       'uploadChatImageIntoTemporaryStore',
-      GQL_QUERIES.uploadChatImageIntoTemporaryStore,
-      {
-        file: null,
-        input: {
-          chatId,
-          clientAttachmentId: crypto.randomUUID(),
+      uploadChatImagePayloadSchema,
+      await this.postMultipart<unknown>(
+        'uploadChatImageIntoTemporaryStore',
+        GQL_QUERIES.uploadChatImageIntoTemporaryStore,
+        {
+          file: null,
+          input: {
+            chatId,
+            clientAttachmentId: crypto.randomUUID(),
+          },
         },
-      },
-      { '1': { path: ['variables.file'], file } },
+        { '1': { path: ['variables.file'], file } },
+      ),
     );
-    return String(data.uploadChatImageIntoTemporaryStore.id);
+    const uploadedId = data.uploadChatImageIntoTemporaryStore?.id;
+    if (!uploadedId) {
+      // No best-effort fallback exists: without an upload id the attachment silently
+      // disappears from the message, so the caller must see a real failure.
+      throw new RequestFailedError(
+        200,
+        'PlayerOK не вернул идентификатор загруженного изображения (контракт uploadChatImageIntoTemporaryStore нарушен)',
+      );
+    }
+    return String(uploadedId);
   }
 
   public async sendMessage(params: SendMessageParams): Promise<ChatMessage> {
@@ -639,21 +661,21 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
       imagesIds.push(id);
     }
 
-    const data = await this.postQuery<{ createChatMessage: any }>(
+    const data = this.guard(
       'createChatMessage',
-      GQL_QUERIES.createChatMessage,
-      {
+      createChatMessagePayloadSchema,
+      await this.postQuery<unknown>('createChatMessage', GQL_QUERIES.createChatMessage, {
         input: {
           chatId: params.chatId,
           imagesIds,
           text: params.text ?? '',
         },
-      },
+      }),
     );
     return mapMessage(data.createChatMessage);
   }
 
-  public async getMyItems(params: GetMyItemsParams = {}): Promise<PaginatedList<ItemProfile>> {
+  public async getMyItems(params: GetMyItemsParams = {}): Promise<PaginatedList<MyItem>> {
     const filter: Record<string, unknown> = {
       userId: this.accountId,
       status: params.statuses && params.statuses.length > 0 ? params.statuses : null,
@@ -713,29 +735,33 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
   }
 
   public async increaseItemPriorityStatus(itemId: string, priorityStatusId: string): Promise<MyItem> {
-    const data = await this.postQuery<{ increaseItemPriorityStatus: any }>(
+    const data = this.guard(
       'increaseItemPriorityStatus',
-      GQL_QUERIES.increaseItemPriorityStatus,
-      {
+      increaseItemPriorityStatusPayloadSchema,
+      await this.postQuery<unknown>('increaseItemPriorityStatus', GQL_QUERIES.increaseItemPriorityStatus, {
         input: {
           itemId,
           priorityStatuses: [priorityStatusId],
           transactionProviderData: { paymentMethodId: null },
           transactionProviderId: TransactionProviderIds.LOCAL,
         },
-      },
+      }),
     );
     return mapItem(data.increaseItemPriorityStatus);
   }
 
   public async publishItem(itemId: string, priorityStatusId: string): Promise<MyItem> {
-    const data = await this.postQuery<{ publishItem: any }>('publishItem', GQL_QUERIES.publishItem, {
-      input: {
-        transactionProviderId: TransactionProviderIds.LOCAL,
-        priorityStatuses: [priorityStatusId],
-        itemId,
-      },
-    });
+    const data = this.guard(
+      'publishItem',
+      publishItemPayloadSchema,
+      await this.postQuery<unknown>('publishItem', GQL_QUERIES.publishItem, {
+        input: {
+          transactionProviderId: TransactionProviderIds.LOCAL,
+          priorityStatuses: [priorityStatusId],
+          itemId,
+        },
+      }),
+    );
     return mapItem(data.publishItem);
   }
 
@@ -759,16 +785,19 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
       attachments.forEach((file, idx) => {
         filesMap[String(idx + 1)] = { path: [`variables.attachments.${idx}`], file };
       });
-      const data = await this.postMultipart<{ createItem: any }>(
+      const data = this.guard(
         'createItem',
-        GQL_QUERIES.createItem,
-        variables,
-        filesMap,
+        createItemPayloadSchema,
+        await this.postMultipart<unknown>('createItem', GQL_QUERIES.createItem, variables, filesMap),
       );
       return mapItem(data.createItem);
     }
 
-    const data = await this.postQuery<{ createItem: any }>('createItem', GQL_QUERIES.createItem, variables);
+    const data = this.guard(
+      'createItem',
+      createItemPayloadSchema,
+      await this.postQuery<unknown>('createItem', GQL_QUERIES.createItem, variables),
+    );
     return mapItem(data.createItem);
   }
 
@@ -780,7 +809,11 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
     if (params.dataFields !== undefined) {
       input.dataFields = params.dataFields.map((f) => ({ fieldId: f.id, value: f.value }));
     }
-    const data = await this.postQuery<{ updateItem: any }>('updateItem', GQL_QUERIES.updateItem, { input });
+    const data = this.guard(
+      'updateItem',
+      updateItemPayloadSchema,
+      await this.postQuery<unknown>('updateItem', GQL_QUERIES.updateItem, { input }),
+    );
     return mapItem(data.updateItem);
   }
 
@@ -826,19 +859,23 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
   }
 
   public async updateDeal(dealId: string, status: ItemDealStatuses): Promise<ItemDeal> {
-    const data = await this.postQuery<{ updateDeal: any }>('updateDeal', GQL_QUERIES.updateDeal, {
-      input: { id: dealId, status },
-    });
+    const data = this.guard(
+      'updateDeal',
+      updateDealPayloadSchema,
+      await this.postQuery<unknown>('updateDeal', GQL_QUERIES.updateDeal, {
+        input: { id: dealId, status },
+      }),
+    );
     return mapDeal(data.updateDeal);
   }
 
   public async reportDealProblem(dealId: string, description: string, problemTypeId: string): Promise<ItemDeal> {
-    const data = await this.postQuery<{ reportDealProblem: any }>(
+    const data = this.guard(
       'reportDealProblem',
-      GQL_QUERIES.reportDealProblem,
-      {
+      reportDealProblemPayloadSchema,
+      await this.postQuery<unknown>('reportDealProblem', GQL_QUERIES.reportDealProblem, {
         input: { dealId, description, problemTypeId },
-      },
+      }),
     );
     return mapDeal(data.reportDealProblem);
   }
@@ -921,10 +958,10 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
   }
 
   public async requestWithdrawal(params: RequestWithdrawalParams): Promise<Transaction> {
-    const data = await this.postQuery<{ requestWithdrawal: any }>(
+    const data = this.guard(
       'requestWithdrawal',
-      GQL_QUERIES.requestWithdrawal,
-      {
+      requestWithdrawalPayloadSchema,
+      await this.postQuery<unknown>('requestWithdrawal', GQL_QUERIES.requestWithdrawal, {
         input: {
           provider: params.provider,
           account: params.account,
@@ -934,16 +971,18 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
             sbpBankMemberId: params.sbpBankMemberId ?? null,
           },
         },
-      },
+      }),
     );
     return mapTransaction(data.requestWithdrawal);
   }
 
   public async removeTransaction(transactionId: string): Promise<Transaction> {
-    const data = await this.postQuery<{ removeTransaction: any }>(
+    const data = this.guard(
       'removeTransaction',
-      GQL_QUERIES.removeTransaction,
-      { id: transactionId },
+      removeTransactionPayloadSchema,
+      await this.postQuery<unknown>('removeTransaction', GQL_QUERIES.removeTransaction, {
+        id: transactionId,
+      }),
     );
     return mapTransaction(data.removeTransaction);
   }

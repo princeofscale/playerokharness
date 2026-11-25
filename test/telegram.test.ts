@@ -128,6 +128,15 @@ describe('@pkh/plugin-telegram', () => {
     );
     expect(stats.text).toContain('1000₽');
 
+    const statsWithTop = renderStats({}, 'week', [
+      { name: 'Steam <Key>', qty: 2, revenue: 1500 },
+    ]);
+    expect(statsWithTop.text).toContain('Топ товаров');
+    expect(statsWithTop.text).toContain('Steam &lt;Key&gt;');
+    expect(statsWithTop.text).toContain('2 шт');
+    // Without analytics the section is omitted entirely.
+    expect(renderStats({}, 'week').text).not.toContain('Топ товаров');
+
     const mods = renderModulesList([
       {
         id: 'demo',

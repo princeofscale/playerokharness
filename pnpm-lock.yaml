@@ -215,6 +215,9 @@ importers:
       '@pkh/core':
         specifier: workspace:*
         version: link:../core
+      '@pkh/plugin-analytics':
+        specifier: workspace:*
+        version: link:../plugin-analytics
       '@pkh/plugin-automation':
         specifier: workspace:*
         version: link:../plugin-automation
@@ -261,6 +264,18 @@ importers:
       '@types/ws':
         specifier: ^8.18.1
         version: 8.18.2
+
+  packages/plugin-analytics:
+    dependencies:
+      '@pkh/adapter':
+        specifier: workspace:*
+        version: link:../playerok
+      '@pkh/core':
+        specifier: workspace:*
+        version: link:../core
+      cordis:
+        specifier: 4.0.0-rc.13
+        version: 4.0.0-rc.13
 
   packages/plugin-automation:
     dependencies:

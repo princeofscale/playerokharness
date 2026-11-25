@@ -947,7 +947,11 @@ export class TelegramService extends Service {
             })
             .catch(() => {});
         } else {
-          await gctx.answerCallbackQuery({ text: 'Задача не найдена', show_alert: true }).catch(() => {});
+          const existing = rq.list().find((task) => task.id === taskId);
+          const text = existing
+            ? `Задача #${taskId} уже выполняется или не в Dead-Letter (${existing.status})`
+            : 'Задача не найдена';
+          await gctx.answerCallbackQuery({ text, show_alert: true }).catch(() => {});
         }
         return this.showView(gctx, renderRetryQueue(rq.list()));
       }
@@ -1009,7 +1013,18 @@ export class TelegramService extends Service {
     if (section === 'stats') {
       await gctx.answerCallbackQuery();
       const period = (['day', 'week', 'month', 'all'].includes(arg1) ? arg1 : 'day') as StatsPeriod;
-      return this.showView(gctx, renderStats(storage.getCachedOrders(), period));
+      // Structural type instead of importing @pkh/plugin-analytics: the panel works
+      // without the package and must not gain a runtime dependency on it.
+      const analytics = this.ctx.get('analytics', false) as
+        | {
+            getTopItems(
+              limit: number,
+              period: StatsPeriod,
+            ): Array<{ name: string; qty: number; revenue: number }>;
+          }
+        | undefined;
+      const topItems = analytics?.getTopItems(5, period) ?? [];
+      return this.showView(gctx, renderStats(storage.getCachedOrders(), period, topItems));
     }
 
     if (section === 'bind') {

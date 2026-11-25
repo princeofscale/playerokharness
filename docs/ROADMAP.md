@@ -149,3 +149,26 @@ Ordered by value per unit of work.
 
 Still open from section 3: SQLite persistence, a stock model with reserved/sold states,
 @grammyjs/runner, plugin manifest/signature, and mutation-response contract schemas.
+
+## 6. Round 3 (2026-11-25) — shipped
+
+- **@pkh/plugin-analytics** — persistent sales analytics (bot_data/analytics.json):
+  per-day revenue/orders/completed/cancelled buckets, top items, idempotent backfill from
+  cached_orders, calendar day/week/month windows, 400-day + 5000-marker retention.
+  Mounted on the root context so the panel can read it.
+- **Mutation contract guard** — 9 loose Zod envelopes covering every GraphQL mutation we
+  call; drift is recorded instead of becoming an undefined field, and the image upload
+  (uploadChatImageIntoTemporaryStore) now fails with a clear error instead of a null deref.
+- **Dashboard analytics + resilient SSE** — /analytics and /api/analytics computed from the
+  order cache, SSE frames carry ids, a 200-event ring buffer replays on Last-Event-ID, and
+  a 15 s heartbeat keeps proxies from closing idle streams.
+- **Core hardening** — logs rotate into latest.log.1/.2 instead of being truncated, recent
+  lines are tail-read, expired access requests are pruned from disk, and a corrupt store
+  recovery is reported once to the log and the boot report instead of silently resetting.
+- **Panel** — the Statistics screen shows the top-5 items by revenue for the selected period.
+- **Ops** — pkh doctor reports retry-queue/DLQ depth, a stale boot marker and dashboard
+  state; CI runs a cold build, a CLI smoke test (help/doctor/dry-run simulation) and now
+  typechecks the test suite through tsconfig.test.json.
+
+Still open: SQLite persistence, a stock model with reserved/sold states, @grammyjs/runner,
+plugin manifest/signature, and net-profit tracking (revenue is gross today).

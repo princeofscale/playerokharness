@@ -1,6 +1,7 @@
 import type { Context } from '@pkh/core';
 import { type WebDashboardConfig, WebDashboardService } from './service.js';
 
+export * from './analytics.js';
 export * from './render.js';
 export * from './service.js';
 

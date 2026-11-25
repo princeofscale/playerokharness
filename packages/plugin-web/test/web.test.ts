@@ -8,6 +8,7 @@ import { MockPlayerokTransport, PlayerokService } from '@pkh/adapter';
 import {
   escapeHtml,
   renderQueue,
+  startOfLocalDay,
   WebDashboardService,
   webDashboardPlugin,
 } from '@pkh/plugin-web';
@@ -65,7 +66,7 @@ async function waitForDashboard(ctx: Context): Promise<WebDashboardService> {
 
 async function bootDashboard(
   token = 'test-token',
-  options: { logSink?: boolean } = {},
+  options: { logSink?: boolean; heartbeatMs?: number } = {},
 ): Promise<Harness> {
   const ctx = new Context();
   await ctx.use(StorageService, { baseDir: makeTempDir() });
@@ -79,7 +80,7 @@ async function bootDashboard(
   if (options.logSink) {
     await ctx.use(LogSinkService, { silentConsole: true });
   }
-  await ctx.use(WebDashboardService, { port: 0, token });
+  await ctx.use(WebDashboardService, { port: 0, token, heartbeatMs: options.heartbeatMs });
 
   const dashboard = await waitForDashboard(ctx);
   const address = dashboard.address;
@@ -499,3 +500,330 @@ describe('@pkh/plugin-web', () => {
     expect(escapeHtml(null)).toBe('');
   });
 });
+
+const HOUR_MS = 3_600_000;
+const DAY_MS = 86_400_000;
+
+interface AnalyticsTotalsPayload {
+  revenue: number;
+  orders: number;
+  averageOrderValue: number | null;
+}
+
+interface AnalyticsPayload {
+  generatedAt: string;
+  cachedOrders: number;
+  today: AnalyticsTotalsPayload;
+  last7Days: AnalyticsTotalsPayload;
+  last30Days: AnalyticsTotalsPayload;
+  allTime: AnalyticsTotalsPayload;
+  topItems: Array<{ itemId: string; itemName: string; revenue: number; orders: number }>;
+}
+
+/**
+ * Seeds a cache whose analytics windows are stable relative to Date.now():
+ * the "today" anchors sit at least a minute after local midnight and never
+ * later than noon, so the numbers below cannot straddle a day boundary.
+ */
+function seedAnalyticsOrders(ctx: Context): void {
+  const now = Date.now();
+  const startOfToday = startOfLocalDay(now);
+  const todayAnchor = Math.min(startOfToday + 12 * HOUR_MS, Math.max(now, startOfToday + 60_000));
+  const at = (offsetMs: number): string => new Date(todayAnchor + offsetMs).toISOString();
+
+  const seeds: Array<{ id: string; price: number; date: string; itemId: string; itemName: string }> =
+    [
+      { id: 'an-today-a', price: 1000, date: at(0), itemId: 'item-a', itemName: 'Товар A' },
+      { id: 'an-today-b', price: 500, date: at(-60_000), itemId: 'item-b', itemName: 'Товар B' },
+      { id: 'an-week', price: 250, date: at(-2 * DAY_MS), itemId: 'item-c', itemName: 'Товар C' },
+      { id: 'an-month', price: 100, date: at(-20 * DAY_MS), itemId: 'item-a', itemName: 'Товар A' },
+      { id: 'an-old', price: 50, date: at(-100 * DAY_MS), itemId: 'item-e', itemName: 'Товар E' },
+      {
+        id: 'an-older',
+        price: 20,
+        date: at(-110 * DAY_MS),
+        itemId: 'item-f',
+        itemName: 'Товар <i>F</i>',
+      },
+      {
+        id: 'an-oldest',
+        price: 10,
+        date: at(-120 * DAY_MS),
+        itemId: 'item-g',
+        itemName: 'Товар G',
+      },
+    ];
+
+  const cached: Record<string, unknown> = {};
+  for (const seed of seeds) {
+    cached[seed.id] = {
+      id: seed.id,
+      price: seed.price,
+      status: 'FINISHED',
+      date: seed.date,
+      item_id: seed.itemId,
+      item_name: seed.itemName,
+    };
+  }
+  ctx.storage.set('cached_orders', cached);
+}
+
+interface SseStream {
+  text(): string;
+  readUntil(
+    predicate: (text: string) => boolean,
+    label?: string,
+    timeoutMs?: number,
+  ): Promise<string>;
+  close(): Promise<void>;
+}
+
+function openSse(response: Response): SseStream {
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error('SSE response has no body');
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  return {
+    text: () => buffer,
+    async readUntil(predicate, label = 'SSE read', timeoutMs = 4000) {
+      while (!predicate(buffer)) {
+        const chunk = await withTimeout(reader.read(), label, timeoutMs);
+        if (chunk.done) throw new Error(`SSE stream ended while waiting for ${label}`);
+        buffer += decoder.decode(chunk.value, { stream: true });
+      }
+      return buffer;
+    },
+    async close() {
+      await reader.cancel().catch(() => {});
+    },
+  };
+}
+
+interface EventBus {
+  parallel(name: string, payload: Record<string, unknown>): Promise<void>;
+}
+
+async function publishRetryEvent(ctx: Context, id: string): Promise<void> {
+  const bus = ctx as unknown as EventBus;
+  await bus.parallel('retry/enqueued', {
+    id,
+    kind: 'send_message',
+    status: 'pending',
+    attempts: 1,
+    maxAttempts: 5,
+    nextRunAt: '2026-11-25T08:45:00.000Z',
+    createdAt: '2026-11-25T08:40:00.000Z',
+    payload: {},
+  });
+}
+
+async function waitFor(condition: () => boolean, label: string, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error(`${label} timed out`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+describe('@pkh/plugin-web analytics', () => {
+  it('aggregates cached orders into today / 7d / 30d / all-time windows', async () => {
+    const harness = await bootDashboard();
+    seedAnalyticsOrders(harness.ctx);
+
+    try {
+      const response = await fetch(authedUrl(harness, '/api/analytics'));
+      expect(response.status).toBe(200);
+      expect(response.headers.get('content-type')).toContain('application/json');
+
+      const data = (await response.json()) as AnalyticsPayload;
+      expect(data.cachedOrders).toBe(7);
+      expect(data.today).toEqual({ revenue: 1500, orders: 2, averageOrderValue: 750 });
+      expect(data.last7Days).toEqual({ revenue: 1750, orders: 3, averageOrderValue: 583.33 });
+      expect(data.last30Days).toEqual({ revenue: 1850, orders: 4, averageOrderValue: 462.5 });
+      expect(data.allTime).toEqual({ revenue: 1930, orders: 7, averageOrderValue: 275.71 });
+
+      // Top five only: item-g is the smallest item and must be cut off.
+      expect(data.topItems.length).toBe(5);
+      expect(data.topItems.map((item) => item.itemId)).toEqual([
+        'item-a',
+        'item-b',
+        'item-c',
+        'item-e',
+        'item-f',
+      ]);
+      expect(data.topItems[0]).toEqual({
+        itemId: 'item-a',
+        itemName: 'Товар A',
+        revenue: 1100,
+        orders: 2,
+      });
+      expect(data.topItems.some((item) => item.itemId === 'item-g')).toBe(false);
+    } finally {
+      await harness.ctx.fiber.dispose();
+    }
+  });
+
+  it('renders the analytics page with a table and bars but never NaN', async () => {
+    const harness = await bootDashboard();
+    seedAnalyticsOrders(harness.ctx);
+
+    try {
+      const response = await fetch(authedUrl(harness, '/analytics'));
+      expect(response.status).toBe(200);
+      expect(response.headers.get('content-type')).toContain('text/html');
+
+      const html = await response.text();
+      expect(html).not.toContain('NaN');
+      expect(html).toContain('Выручка по периодам');
+      expect(html).toContain('1500.00');
+      expect(html).toContain('1930.00');
+      expect(html).toContain('583.33');
+      expect(html).toContain('Товар A');
+      expect(html).toContain('<ul class="bars">');
+      // item-a is the revenue leader, so its bar spans the full track.
+      expect(html).toContain('width:100%');
+      // Item names in the bar list are HTML-escaped too.
+      expect(html).toContain('Товар &lt;i&gt;F&lt;/i&gt;');
+      expect(html).not.toContain('<i>F</i>');
+    } finally {
+      await harness.ctx.fiber.dispose();
+    }
+  });
+
+  it('shows "нет данных" instead of NaN when the order cache is empty', async () => {
+    const harness = await bootDashboard();
+
+    try {
+      const json = await fetch(authedUrl(harness, '/api/analytics'));
+      const data = (await json.json()) as AnalyticsPayload;
+      expect(data.cachedOrders).toBe(0);
+      expect(data.today).toEqual({ revenue: 0, orders: 0, averageOrderValue: null });
+      expect(data.last7Days.averageOrderValue).toBeNull();
+      expect(data.last30Days.averageOrderValue).toBeNull();
+      expect(data.allTime).toEqual({ revenue: 0, orders: 0, averageOrderValue: null });
+      expect(data.topItems).toEqual([]);
+
+      const html = await (await fetch(authedUrl(harness, '/analytics'))).text();
+      expect(html).not.toContain('NaN');
+      expect(html).toContain('Кэш сделок пуст');
+      expect(html).toContain('нет данных');
+      expect(html).toContain('0.00 ₽');
+    } finally {
+      await harness.ctx.fiber.dispose();
+    }
+  });
+});
+
+describe('@pkh/plugin-web SSE resilience', () => {
+  it('writes ids on every frame and replays only newer buffered events', async () => {
+    const harness = await bootDashboard();
+
+    try {
+      // Published with no client attached: frames must still land in the buffer.
+      await publishRetryEvent(harness.ctx, 'evt-1');
+      await publishRetryEvent(harness.ctx, 'evt-2');
+      await publishRetryEvent(harness.ctx, 'evt-3');
+
+      expect(harness.dashboard.lastEventId).toBe(3);
+      expect(harness.dashboard.bufferedEvents.map((frame) => frame.id)).toEqual([1, 2, 3]);
+
+      // ?lastEventId=2 must replay id 3 only, with the id line written first.
+      const resumed = openSse(
+        await fetch(`${authedUrl(harness, '/events')}&lastEventId=2`),
+      );
+      try {
+        await resumed.readUntil((text) => text.includes('evt-3'), 'replayed frame');
+        expect(resumed.text()).toContain('id: 3');
+        expect(resumed.text()).not.toContain('evt-2');
+        expect(resumed.text()).not.toContain('evt-1');
+
+        // The Last-Event-ID header with id 0 replays the whole buffer.
+        const headerResumed = openSse(
+          await fetch(authedUrl(harness, '/events'), { headers: { 'last-event-id': '0' } }),
+        );
+        try {
+          await headerResumed.readUntil((text) => text.includes('evt-3'), 'header replay');
+          expect(headerResumed.text()).toContain('id: 1');
+          expect(headerResumed.text()).toContain('evt-1');
+          expect(headerResumed.text()).toContain('evt-2');
+
+          // Live frames continue the sequence for every attached client.
+          await publishRetryEvent(harness.ctx, 'evt-live');
+          await resumed.readUntil((text) => text.includes('evt-live'), 'live frame');
+          await headerResumed.readUntil((text) => text.includes('evt-live'), 'live frame (header)');
+          expect(resumed.text()).toContain('id: 4');
+          expect(headerResumed.text()).toContain('id: 4');
+
+          // A client without Last-Event-ID starts live and gets no history.
+          const fresh = openSse(await fetch(authedUrl(harness, '/events')));
+          try {
+            await fresh.readUntil((text) => text.includes(': connected'), 'fresh greeting');
+            expect(fresh.text()).not.toContain('evt-');
+          } finally {
+            await fresh.close();
+          }
+        } finally {
+          await headerResumed.close();
+        }
+      } finally {
+        await resumed.close();
+      }
+    } finally {
+      await harness.ctx.fiber.dispose();
+    }
+  });
+
+  it('caps the replay buffer at 200 frames', async () => {
+    const harness = await bootDashboard();
+
+    try {
+      for (let index = 1; index <= 205; index += 1) {
+        await publishRetryEvent(harness.ctx, `evt-${index}`);
+      }
+
+      const buffered = harness.dashboard.bufferedEvents;
+      expect(buffered.length).toBe(200);
+      expect(buffered[0]?.id).toBe(6);
+      expect(buffered[buffered.length - 1]?.id).toBe(205);
+      expect(harness.dashboard.lastEventId).toBe(205);
+    } finally {
+      await harness.ctx.fiber.dispose();
+    }
+  });
+
+  it('pings streams, clears timers on client close and on dispose, and disposes twice safely', async () => {
+    const harness = await bootDashboard('test-token', { heartbeatMs: 40 });
+
+    const first = openSse(await fetch(authedUrl(harness, '/events')));
+    const second = openSse(await fetch(authedUrl(harness, '/events')));
+
+    try {
+      await first.readUntil((text) => text.includes(': ping'), 'SSE heartbeat', 3000);
+      expect(harness.dashboard.openStreams).toBe(2);
+      expect(harness.dashboard.heartbeatTimers).toBe(2);
+
+      // A closed client drops its stream and its keep-alive timer.
+      await first.close();
+      await waitFor(
+        () => harness.dashboard.openStreams === 1 && harness.dashboard.heartbeatTimers === 1,
+        'client-close cleanup',
+      );
+
+      await harness.ctx.fiber.dispose();
+      expect(harness.dashboard.address).toBeNull();
+      expect(harness.dashboard.openStreams).toBe(0);
+      expect(harness.dashboard.heartbeatTimers).toBe(0);
+
+      // Second dispose is a no-op: no throw, no revived socket or timer.
+      await expect(harness.ctx.fiber.dispose()).resolves.toBeUndefined();
+      expect(harness.dashboard.address).toBeNull();
+      expect(harness.dashboard.openStreams).toBe(0);
+      expect(harness.dashboard.heartbeatTimers).toBe(0);
+    } finally {
+      await first.close();
+      await second.close();
+    }
+  });
+});
+

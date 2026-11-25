@@ -60,11 +60,13 @@ export const messagesPlugin = {
 
         const lower = text.toLowerCase();
         const isEscalation = lower === '!продавец' || lower === '!seller';
+        const commands = ctx.storage.getCustomCommands();
+        const matchedKey = Object.keys(commands).find((k) => k.toLowerCase() === lower);
 
-        // Greeting used to swallow the buyer's very first message, so a brand-new
-        // buyer whose first message was the documented !продавец command was never
-        // escalated to the seller.
-        if (isNewUser && !isEscalation) {
+        // The greeting used to swallow the buyer's very first message, so a brand-new buyer
+        // whose first message was a documented command (!продавец, !инфо, …) never got it
+        // executed — the welcome text answered instead. Greet plain text only.
+        if (isNewUser && !isEscalation && !matchedKey) {
           const greeting = renderNamedMessage(ctx, 'first_message', {
             user: otherUser,
             chat: event.chat,
@@ -90,8 +92,6 @@ export const messagesPlugin = {
           return;
         }
 
-        const commands = ctx.storage.getCustomCommands();
-        const matchedKey = Object.keys(commands).find((k) => k.toLowerCase() === lower);
         if (matchedKey) {
           const lines = commands[matchedKey];
           if (lines && lines.length > 0) {

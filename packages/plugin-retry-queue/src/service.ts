@@ -314,8 +314,11 @@ export class RetryQueueService extends Service {
       const store = this.ctx.storage.get<RetryQueueStore>(STORE_KEY);
 
       if (options.dedupeKey) {
+        // 'processing' is live too: while the first copy is being retried, a second copy
+        // would run the same side effect again as soon as the first attempt ends
+        // (a duplicate bump charges the premium twice, a duplicate send re-delivers goods).
         const existing = store.tasks.find(
-          (t) => t.dedupeKey === options.dedupeKey && t.status === 'pending',
+          (t) => t.dedupeKey === options.dedupeKey && t.status !== 'dead',
         );
         if (existing) {
           if (options.error) {
@@ -347,7 +350,10 @@ export class RetryQueueService extends Service {
     this.log.warn(
       `Задача поставлена в очередь повторов: [${task.kind}] #${task.id}${task.lastError ? ` (${task.lastError})` : ''}`,
     );
-    await this.ctx.parallel('retry/enqueued', task);
+    // The task is already persisted: a throwing listener must not make the caller believe
+    // the hand-off failed (auto-delivery would return the reserved key to stock while the
+    // very same key still sits in a queued retry — the same goods sold twice).
+    await this.emitSafely('retry/enqueued', task);
     return task;
   }
 
@@ -386,7 +392,7 @@ export class RetryQueueService extends Service {
           this.log.warn(
             `Задача [${task.kind}] #${task.id}: просроченная аренда (${claim.previousClaimedBy ?? 'владелец неизвестен'}) возвращена в обработку`,
           );
-          await this.ctx.parallel('retry/lease-reclaimed', task);
+          await this.emitSafely('retry/lease-reclaimed', task);
         }
 
         const handler = this.handlers.get(task.kind);
@@ -404,25 +410,46 @@ export class RetryQueueService extends Service {
           continue;
         }
 
+        // Only the handler itself may turn this attempt into a failure. Lease removal,
+        // counters and lifecycle events used to share this try, so a throwing
+        // `retry/succeeded` listener re-marked a successful task as failed and reported it
+        // twice (succeeded + rescheduled).
+        let failed = false;
+        let handlerError: unknown;
         try {
           await handler(task.payload, task);
-          await this.removeTask(id);
+        } catch (err) {
+          failed = true;
+          handlerError = err;
+        }
+
+        if (!failed) {
+          try {
+            await this.removeTask(id);
+          } catch (err) {
+            // The side effect already happened: a bookkeeping failure must never hand the
+            // task back for another attempt (a second bump/publish/send charges twice).
+            this.log.error(
+              `Задача [${task.kind}] #${id} выполнена, но не удалена из очереди: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
           succeeded += 1;
           this.log.info(`Повторная задача [${task.kind}] #${id} успешно выполнена`);
-          await this.ctx.parallel('retry/succeeded', task);
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          // A PermanentTaskError means the payload itself is invalid: retrying cannot help,
-          // so the task goes to the DLQ at once and the DLQ message carries the reason.
-          const becameDead = await this.markFailed(
-            id,
-            message,
-            now,
-            err instanceof PermanentTaskError,
-          );
-          if (becameDead) deadLettered += 1;
-          else rescheduled += 1;
+          await this.emitSafely('retry/succeeded', task);
+          continue;
         }
+
+        // A PermanentTaskError means the payload itself is invalid: retrying cannot help,
+        // so the task goes to the DLQ at once and the DLQ message carries the reason.
+        const message = handlerError instanceof Error ? handlerError.message : String(handlerError);
+        const becameDead = await this.markFailed(
+          id,
+          message,
+          now,
+          handlerError instanceof PermanentTaskError,
+        );
+        if (becameDead) deadLettered += 1;
+        else rescheduled += 1;
       } finally {
         this.inFlight.delete(id);
       }
@@ -437,6 +464,25 @@ export class RetryQueueService extends Service {
     }
 
     return { succeeded, rescheduled, deadLettered };
+  }
+
+  /**
+   * Dispatches a task-lifecycle event without letting a misbehaving listener undo the state
+   * change that already happened: `ctx.parallel` rejects as soon as one listener throws, and
+   * an aborting emit used to cancel the whole poll pass (the remaining due tasks were skipped
+   * until the next tick) or make `enqueue` reject after the task had been persisted.
+   */
+  private async emitSafely(
+    event: 'retry/enqueued' | 'retry/succeeded' | 'retry/dead-letter' | 'retry/lease-reclaimed',
+    task: RetryTask,
+  ): Promise<void> {
+    try {
+      await this.ctx.parallel(event, task);
+    } catch (err) {
+      this.log.error(
+        `Обработчик события «${event}» завершился ошибкой: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   private isDue(task: RetryTask, now: Date): boolean {
@@ -597,18 +643,24 @@ export class RetryQueueService extends Service {
       this.log.error(
         `Задача [${task.kind}] #${task.id} переведена в Dead-Letter после ${task.attempts} попыток: ${errorMessage}`,
       );
-      await this.ctx.parallel('retry/dead-letter', task);
-      await this.ctx.parallel('notify/log', {
-        title: `☠️ Задача <code>${escapeHtml(task.kind)}</code> #${escapeHtml(task.id)} попала в Dead-Letter`,
-        body: `Попыток: <b>${task.attempts}/${task.maxAttempts}</b>\nОшибка: <blockquote>${escapeHtml(errorMessage)}</blockquote>`,
-        buttons: [
-          [
-            { text: '♻️ Повторить', callbackData: `rq:retry:${task.id}` },
-            { text: '🗑 Удалить', callbackData: `rq:del:${task.id}` },
+      await this.emitSafely('retry/dead-letter', task);
+      try {
+        await this.ctx.parallel('notify/log', {
+          title: `☠️ Задача <code>${escapeHtml(task.kind)}</code> #${escapeHtml(task.id)} попала в Dead-Letter`,
+          body: `Попыток: <b>${task.attempts}/${task.maxAttempts}</b>\nОшибка: <blockquote>${escapeHtml(errorMessage)}</blockquote>`,
+          buttons: [
+            [
+              { text: '♻️ Повторить', callbackData: `rq:retry:${task.id}` },
+              { text: '🗑 Удалить', callbackData: `rq:del:${task.id}` },
+            ],
+            [{ text: '🔁 Открыть очередь', callbackData: 'menu:retry_queue' }],
           ],
-          [{ text: '🔁 Открыть очередь', callbackData: 'menu:retry_queue' }],
-        ],
-      });
+        });
+      } catch (err) {
+        this.log.error(
+          `Не удалось отправить уведомление о Dead-Letter задаче #${task.id}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
       return true;
     }
 
@@ -622,7 +674,9 @@ export class RetryQueueService extends Service {
     return this.ctx.storage.runExclusive(STORE_KEY, () => {
       const store = this.ctx.storage.get<RetryQueueStore>(STORE_KEY);
       const target = store.tasks.find((t) => t.id === taskId);
-      if (!target) return false;
+      // Resurrecting a task that another poll pass currently holds a lease on would run it
+      // twice (the in-flight handler plus the queued copy), so only DLQ entries qualify.
+      if (!target || target.status !== 'dead') return false;
       target.status = 'pending';
       target.attempts = 0;
       target.nextRunAt = now.toISOString();

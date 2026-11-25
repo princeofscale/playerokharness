@@ -1,0 +1,48 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": [
+      "node"
+    ],
+    "baseUrl": ".",
+    "paths": {
+      "@pkh/core": [
+        "packages/core/src/index.ts"
+      ],
+      "@pkh/adapter": [
+        "packages/playerok/src/index.ts"
+      ],
+      "@pkh/plugin-automation": [
+        "packages/plugin-automation/src/index.ts"
+      ],
+      "@pkh/plugin-retry-queue": [
+        "packages/plugin-retry-queue/src/index.ts"
+      ],
+      "@pkh/plugin-telegram": [
+        "packages/plugin-telegram/src/index.ts"
+      ],
+      "@pkh/plugin-web": [
+        "packages/plugin-web/src/index.ts"
+      ],
+      "@pkh/plugin-analytics": [
+        "packages/plugin-analytics/src/index.ts"
+      ],
+      "@pkh/app": [
+        "packages/app/src/index.ts"
+      ],
+      "ws": [
+        "packages/playerok/node_modules/@types/ws/index.d.ts"
+      ]
+    },
+    "typeRoots": [
+      "./node_modules/@types",
+      "./packages/playerok/node_modules/@types"
+    ]
+  },
+  "include": [
+    "test/**/*.ts",
+    "packages/*/test/**/*.ts",
+    "vitest.config.ts"
+  ]
+}

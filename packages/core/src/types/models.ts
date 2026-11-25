@@ -302,7 +302,7 @@ export interface SetupProblem {
 
 export interface BootError {
   module: string;
-  stage: 'load' | 'start' | 'disabled';
+  stage: 'load' | 'start' | 'disabled' | 'recover';
   text: string;
   trace: string;
 }

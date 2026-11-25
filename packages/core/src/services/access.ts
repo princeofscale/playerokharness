@@ -96,12 +96,28 @@ export class AccessService extends Service {
     const nowSec = Math.floor(Date.now() / 1000);
     const all = this.ctx.storage.get<AccessRequests>('access_requests');
     const active: AccessRequests = {};
+    let dropped = 0;
     for (const [key, req] of Object.entries(all)) {
       if (nowSec - req.time < REQUEST_COOLDOWN_SEC) {
         active[key] = req;
+      } else {
+        dropped += 1;
       }
     }
+    // Expired requests used to be filtered in memory only, so the file grew forever.
+    // Persist the prune once, on the first read that observes stale entries.
+    if (dropped > 0) {
+      this.ctx.storage.set<AccessRequests>('access_requests', active);
+    }
     return active;
+  }
+
+  /** Drops every expired access request and returns how many were removed. */
+  public pruneExpiredRequests(): number {
+    const before = Object.keys(this.ctx.storage.get<AccessRequests>('access_requests')).length;
+    this.getActiveRequests();
+    const after = Object.keys(this.ctx.storage.get<AccessRequests>('access_requests')).length;
+    return Math.max(0, before - after);
   }
 
   public getRequest(userId: number): AccessRequest | null {

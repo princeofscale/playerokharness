@@ -43,3 +43,10 @@ jobs:
 
       - name: Test
         run: pnpm test
+
+      - name: CLI smoke (help, doctor, dry-run simulation)
+        run: |
+          node packages/app/dist/cli.js --help > /dev/null
+          TMPD=$(mktemp -d)
+          node packages/app/dist/cli.js doctor --data-dir "$TMPD"
+          node packages/app/dist/cli.js start --dry-run --simulate --no-telegram --data-dir "$TMPD"
