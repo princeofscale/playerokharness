@@ -5,6 +5,7 @@ import {
   escapeHtml,
   ItemDealStatuses,
   safeInterval,
+  TransactionProviderIds,
   Service,
   z,
 } from '@pkh/core';
@@ -256,6 +257,39 @@ export class RetryQueueService extends Service {
       await this.ctx.playerok.publishItem(itemId, priorityStatusId);
     });
 
+    // A withdrawal is money: it must be retried at least once after a transient API
+    // failure instead of burning the whole schedule window (auto-withdrawal used to
+    // stamp last_time before the call and silently skip a day on one 502).
+    this.registerHandler('request_withdrawal', async (payload) => {
+      const account = String(payload.account ?? '');
+      const value = Number(payload.value ?? 0);
+      const provider = String(payload.provider ?? '') as TransactionProviderIds;
+      const sbpBankMemberId =
+        typeof payload.sbpBankMemberId === 'string' && payload.sbpBankMemberId
+          ? payload.sbpBankMemberId
+          : null;
+      if (!account) {
+        throw new PermanentTaskError('request_withdrawal: не указаны реквизиты вывода');
+      }
+      if (!Number.isFinite(value) || value <= 0) {
+        throw new PermanentTaskError('request_withdrawal: некорректная сумма вывода');
+      }
+      if (!Object.values(TransactionProviderIds).includes(provider)) {
+        throw new PermanentTaskError(
+          `request_withdrawal: недопустимый провайдер «${String(payload.provider)}»`,
+        );
+      }
+      const tx = await this.ctx.playerok.requestWithdrawal({
+        provider,
+        account,
+        value,
+        sbpBankMemberId,
+      });
+      if (!tx?.id) {
+        throw new Error('requestWithdrawal вернул пустую транзакцию');
+      }
+    });
+
     this.registerHandler('bump_item', async (payload) => {
       const itemId = String(payload.itemId ?? '');
       const priorityStatusId = String(payload.priorityStatusId ?? '');
@@ -416,11 +450,14 @@ export class RetryQueueService extends Service {
         // twice (succeeded + rescheduled).
         let failed = false;
         let handlerError: unknown;
+        const stopHeartbeat = this.startLeaseHeartbeat(id);
         try {
           await handler(task.payload, task);
         } catch (err) {
           failed = true;
           handlerError = err;
+        } finally {
+          stopHeartbeat();
         }
 
         if (!failed) {
@@ -509,6 +546,41 @@ export class RetryQueueService extends Service {
    * after the winner's write and sees status 'processing' with a fresh lease: the loser gets
    * task null and never touches the handler.
    */
+  /**
+   * Renews the lease of a task this worker is executing right now.
+   *
+   * Without it a handler that legitimately runs longer than leaseMs (a slow PlayerOK
+   * call, a big image upload) is considered abandoned and a second instance reclaims it,
+   * executing the same side effect twice — the exact thing the lease exists to prevent.
+   */
+  private async renewLease(taskId: string): Promise<void> {
+    try {
+      await this.ctx.storage.runExclusive(STORE_KEY, () => {
+        const store = this.ctx.storage.get<RetryQueueStore>(STORE_KEY);
+        const target = store.tasks.find((t) => t.id === taskId);
+        if (!target || target.status !== 'processing' || target.claimedBy !== this.workerId) {
+          return;
+        }
+        target.claimedAt = new Date().toISOString();
+        this.ctx.storage.set<RetryQueueStore>(STORE_KEY, store);
+      });
+    } catch (err) {
+      this.log.debug(
+        `Не удалось продлить аренду задачи #${taskId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /** Keeps a lease alive while its handler runs; returns the stop function. */
+  private startLeaseHeartbeat(taskId: string): () => void {
+    const everyMs = Math.max(50, Math.floor(this.leaseMs / 3));
+    const timer = setInterval(() => {
+      void this.renewLease(taskId);
+    }, everyMs);
+    timer.unref?.();
+    return () => clearInterval(timer);
+  }
+
   private async claimTask(taskId: string, now: Date): Promise<ClaimOutcome> {
     let outcome: ClaimOutcome = { task: null, reclaimedLease: false };
 

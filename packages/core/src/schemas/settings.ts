@@ -195,9 +195,29 @@ export type MessagesSettings = z.infer<typeof MessagesSettingsSchema>;
 export const CustomCommandsSchema = z.record(z.string(), z.array(z.string()));
 export type CustomCommandsSettings = z.infer<typeof CustomCommandsSchema>;
 
+/**
+ * A piece-by-piece key that was taken out of the sellable pool for one deal.
+ *
+ * Deliberately stored next to `goods` instead of inside it: everything in `goods`
+ * is available to any buyer, so a key that is mid-send (or waiting for a retry)
+ * must leave that array before the network call starts. `reserved` is optional and
+ * additive, so configs written before this field existed still parse and load.
+ */
+export const AutoDeliveryReservationSchema = z.object({
+  good: z.string(),
+  dealId: z.string(),
+  /** ISO timestamp of the reservation, used by the stale-reservation sweep. */
+  at: z.string(),
+});
+
+export type AutoDeliveryReservation = z.infer<typeof AutoDeliveryReservationSchema>;
+
 export const AutoDeliveryRuleSchema = ItemBindingSchema.extend({
   piece: z.boolean().default(false),
+  /** The available pool the panel shows and the only source of a new key. */
   goods: z.array(z.string()).optional(),
+  /** Keys in flight for a specific deal; never handed to another buyer. */
+  reserved: z.array(AutoDeliveryReservationSchema).optional(),
   message: z.array(z.string()).optional(),
 });
 export type AutoDeliveryRule = z.infer<typeof AutoDeliveryRuleSchema>;

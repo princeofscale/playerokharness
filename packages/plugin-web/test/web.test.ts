@@ -169,6 +169,88 @@ describe('@pkh/plugin-web', () => {
     }
   });
 
+  it('mints a single-use, session-scoped access token', async () => {
+    const harness = await bootDashboard();
+
+    try {
+      const minted = harness.dashboard.mintAccessToken();
+      expect(minted).toBeTruthy();
+      const mintedUrl = `${harness.baseUrl}/api/status?token=${encodeURIComponent(minted ?? '')}`;
+
+      const first = await fetch(mintedUrl);
+      expect(first.status).toBe(200);
+      // Same credential, but a session cookie: no Max-Age, so it dies with the browser.
+      const cookie = first.headers.get('set-cookie') ?? '';
+      expect(cookie).toContain('pkh_web_token=');
+      expect(cookie).not.toContain('Max-Age');
+
+      // Single use: the very same link is rejected the second time.
+      const second = await fetch(mintedUrl);
+      expect(second.status).toBe(401);
+      expect(await second.text()).toContain('Требуется токен');
+
+      // The shared long-lived token is untouched by the consumption above.
+      const shared = await fetch(authedUrl(harness, '/api/status'));
+      expect(shared.status).toBe(200);
+      expect(shared.headers.get('set-cookie') ?? '').toContain('Max-Age=604800');
+
+      // The session cookie keeps navigation working after the one-time token is gone.
+      const viaCookie = await fetch(`${harness.baseUrl}/deals`, {
+        headers: { cookie: `pkh_web_token=${encodeURIComponent(harness.token)}` },
+      });
+      expect(viaCookie.status).toBe(200);
+    } finally {
+      await harness.ctx.fiber.dispose();
+    }
+  });
+
+  it('rejects an expired minted token', async () => {
+    const harness = await bootDashboard();
+
+    try {
+      const expired = harness.dashboard.mintAccessToken(1);
+      expect(expired).toBeTruthy();
+      await new Promise((resolve) => setTimeout(resolve, 30));
+
+      const response = await fetch(
+        `${harness.baseUrl}/api/status?token=${encodeURIComponent(expired ?? '')}`,
+      );
+      expect(response.status).toBe(401);
+    } finally {
+      await harness.ctx.fiber.dispose();
+    }
+  });
+
+  it('bounds the minted-token map at 50 entries and evicts the oldest', async () => {
+    const harness = await bootDashboard();
+
+    try {
+      const minted: string[] = [];
+      for (let index = 0; index < 60; index += 1) {
+        const token = harness.dashboard.mintAccessToken();
+        expect(token).toBeTruthy();
+        minted.push(token ?? '');
+      }
+      expect(harness.dashboard.accessTokenCount).toBeLessThanOrEqual(50);
+
+      // The oldest entries were evicted, so their links no longer authenticate.
+      const evicted = await fetch(
+        `${harness.baseUrl}/api/status?token=${encodeURIComponent(minted[0] ?? '')}`,
+      );
+      expect(evicted.status).toBe(401);
+
+      // The newest one still works exactly once.
+      const newestUrl = `${harness.baseUrl}/api/status?token=${encodeURIComponent(minted[minted.length - 1] ?? '')}`;
+      expect((await fetch(newestUrl)).status).toBe(200);
+      expect((await fetch(newestUrl)).status).toBe(401);
+
+      // And the shared token was never affected by the cap.
+      expect((await fetch(authedUrl(harness, '/api/status'))).status).toBe(200);
+    } finally {
+      await harness.ctx.fiber.dispose();
+    }
+  });
+
   it('returns the overview as JSON on /api/status', async () => {
     const harness = await bootDashboard();
     seedCachedOrders(harness.ctx);
@@ -487,6 +569,8 @@ describe('@pkh/plugin-web', () => {
       const dashboard = ctx.get('webDashboard', false);
       expect(dashboard).toBeDefined();
       expect(dashboard?.address).toBeNull();
+      // Nothing to mint while the dashboard is disabled.
+      expect(dashboard?.mintAccessToken()).toBeNull();
     } finally {
       await ctx.fiber.dispose();
     }

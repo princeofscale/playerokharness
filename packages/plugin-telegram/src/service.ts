@@ -118,6 +118,7 @@ export const CALLBACK_SECTIONS = [
   'item',
   'action',
   'fsm',
+  'web',
 ] as const;
 
 export function isKnownCallbackSection(data: string): boolean {
@@ -142,6 +143,23 @@ export interface TelegramServiceConfig {
   customApiUrl?: string;
   proxy?: string;
   onSetupLaunch?: () => Promise<SetupProblem | null>;
+}
+
+/**
+ * Structural view of @pkh/plugin-web. The dashboard is an optional plugin and this package
+ * must not depend on it, so the panel reads the service by name and only needs these three
+ * members: a Telegram button can then mint a link without importing the web package.
+ */
+interface WebDashboardLike {
+  enabled?: boolean;
+  url?: string | null;
+  mintAccessToken?: (ttlMs?: number) => string | null;
+}
+
+/** Result of minting a dashboard link: a URL, or the reason there is none. */
+interface DashboardLink {
+  url: string | null;
+  reason: string | null;
 }
 
 export class TelegramService extends Service {
@@ -781,6 +799,52 @@ export class TelegramService extends Service {
   }
 
   /**
+   * Reads the optional web panel through the non-strict accessor and swallows every failure:
+   * an absent, disabled or broken dashboard is a normal deployment, not an exception.
+   */
+  private dashboardService(): WebDashboardLike | null {
+    try {
+      return (this.ctx.get('webDashboard', false) as WebDashboardLike | undefined) ?? null;
+    } catch (err) {
+      this.log.warn(
+        `Веб-панель недоступна: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return null;
+    }
+  }
+
+  /** Mints a one-time dashboard URL, or explains why there is none. Never throws. */
+  private mintDashboardLink(): DashboardLink {
+    const dashboard = this.dashboardService();
+    if (!dashboard) {
+      return {
+        url: null,
+        reason: 'Веб-панель не подключена: включите плагин @pkh/plugin-web в конфиге бота.',
+      };
+    }
+    if (dashboard.enabled === false) {
+      return { url: null, reason: 'Веб-панель отключена в конфиге (web.enabled: false).' };
+    }
+
+    const base = dashboard.url ?? null;
+    if (!base) {
+      return { url: null, reason: 'Веб-панель ещё не заняла порт — смотрите логи запуска.' };
+    }
+
+    try {
+      const token = dashboard.mintAccessToken ? dashboard.mintAccessToken() : null;
+      if (!token) {
+        return { url: null, reason: 'Веб-панель не выдала одноразовый токен — проверьте её логи.' };
+      }
+      return { url: `${base}/?token=${encodeURIComponent(token)}`, reason: null };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.log.warn(`Не удалось выдать ссылку на веб-панель: ${message}`);
+      return { url: null, reason: `Веб-панель не выдала ссылку: ${message}` };
+    }
+  }
+
+  /**
    * Resolves one dynamic callback segment. Keyboards emit a readable literal while the value
    * fits the byte budget and only fall back to a stored token for long values, so this accepts
    * both forms. A token the registry no longer knows (restart, evicted entry) answers with the
@@ -897,6 +961,33 @@ export class TelegramService extends Service {
       }
     }
 
+    if (section === 'web') {
+      // The ack goes first: the reply below carries the one-time URL and must still be sent
+      // when Telegram rejects the (possibly already answered) callback query.
+      await gctx.answerCallbackQuery().catch(() => {});
+      const link = this.mintDashboardLink();
+      const text = link.url
+        ? [
+            '🌐 <b>Доступ к веб-панели</b>',
+            '',
+            `<a href="${escapeHtml(link.url)}">${escapeHtml(link.url)}</a>`,
+            '',
+            '<i>Ссылка одноразовая и действует 10 минут — открывайте её сразу.</i>',
+          ].join('\n')
+        : `⚠️ ${escapeHtml(link.reason ?? 'Веб-панель недоступна')}`;
+      try {
+        await gctx.reply(text, {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+        });
+      } catch (err) {
+        this.log.warn(
+          `Не удалось отправить ссылку на дашборд: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      return;
+    }
+
     if (section === 'rq') {
       const rq = this.ctx.get('retryQueue', false);
       if (!rq) {
@@ -958,6 +1049,18 @@ export class TelegramService extends Service {
       if (arg1 === 'del') {
         const taskId = await this.resolveCallbackValue(gctx, 'rq:del', arg2);
         if (!taskId) return;
+        // A leased task is running right now: deleting the row would silently drop the
+        // bookkeeping of a side effect that is already in flight.
+        const running = rq.list().some((task) => task.id === taskId && task.status === 'processing');
+        if (running) {
+          await gctx
+            .answerCallbackQuery({
+              text: `Задача #${taskId} выполняется прямо сейчас — удалить нельзя, дождитесь завершения`,
+              show_alert: true,
+            })
+            .catch(() => {});
+          return this.showView(gctx, renderRetryQueue(rq.list()));
+        }
         const removed = await rq.removeTask(taskId);
         await gctx
           .answerCallbackQuery({ text: removed ? `Задача #${taskId} удалена` : 'Задача не найдена' })
@@ -1071,9 +1174,16 @@ export class TelegramService extends Service {
       }
       if (arg1 === 'clear_goods') {
         const updated = storage.update<AutoDeliveryRule[]>('auto_deliveries', (list) => {
-          if (list[idx]) list[idx].goods = [];
+          if (list[idx]) {
+            // Both pools: keys already promised to a buyer live in "reserved" and would
+            // otherwise reappear in the sellable pool once the reservation sweep expires.
+            list[idx].goods = [];
+            list[idx].reserved = [];
+          }
         });
-        await gctx.answerCallbackQuery({ text: 'Поштучные товары очищены' }).catch(() => {});
+        await gctx
+          .answerCallbackQuery({ text: 'Поштучные товары и резервы очищены' })
+          .catch(() => {});
         if (updated[idx]) return this.showView(gctx, renderDeliveryDetail(idx, updated[idx]));
       }
       if (arg1 === 'del') {

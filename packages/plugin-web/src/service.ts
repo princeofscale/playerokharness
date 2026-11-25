@@ -62,6 +62,10 @@ const MAX_DEAL_ROWS = 100;
 const MAX_QUEUE_ROWS = 100;
 const MAX_LOG_LINES = 200;
 const ACCOUNT_CACHE_MS = 5_000;
+/** Lifetime of a token minted by {@link WebDashboardService.mintAccessToken}: one click, ten minutes. */
+export const ACCESS_TOKEN_TTL_MS = 10 * 60 * 1000;
+/** Hard cap on minted-but-unused tokens, so a chatty button cannot grow the map without limit. */
+export const MAX_ACCESS_TOKENS = 50;
 /** Frames kept for Last-Event-ID replay; older ones are dropped, memory stays bounded. */
 export const MAX_EVENT_BUFFER = 200;
 /** SSE comment written every fifteen seconds so proxies keep the stream open. */
@@ -254,6 +258,11 @@ export class WebDashboardService extends Service {
   public readonly heartbeatMs: number;
   private accountCache: { at: number; account: AccountInfo | null; error: string | null } | null =
     null;
+  /**
+   * Minted one-time dashboard tokens -> expiry timestamp (epoch ms). Memory only: a
+   * restart invalidates every outstanding link, which is what "short-lived" must mean.
+   */
+  private readonly accessTokens = new Map<string, number>();
 
   constructor(ctx: Context, config: WebDashboardConfig = {}) {
     super(ctx, 'webDashboard');
@@ -322,6 +331,55 @@ export class WebDashboardService extends Service {
     return [...this.eventBuffer];
   }
 
+  /** Number of minted links that were not used yet (never above {@link MAX_ACCESS_TOKENS}). */
+  public get accessTokenCount(): number {
+    return this.accessTokens.size;
+  }
+
+  /**
+   * Mints a single-use dashboard token, e.g. for a chat button that must not carry the
+   * shared long-lived token in message history. The token authenticates exactly one
+   * request, then it is gone; expiry and the {@link MAX_ACCESS_TOKENS} cap keep the
+   * in-memory map pruned and bounded. Returns null when the dashboard is disabled.
+   */
+  public mintAccessToken(ttlMs: number = ACCESS_TOKEN_TTL_MS): string | null {
+    if (!this.enabled) return null;
+    const now = Date.now();
+    const ttl = Number.isFinite(ttlMs) && ttlMs > 0 ? Math.floor(ttlMs) : ACCESS_TOKEN_TTL_MS;
+    this.pruneAccessTokens(now);
+    // Oldest entry first: insertion order is mint order, and tokens are never refreshed.
+    while (this.accessTokens.size >= MAX_ACCESS_TOKENS) {
+      const oldest = this.accessTokens.keys().next();
+      if (oldest.done) break;
+      this.accessTokens.delete(oldest.value);
+    }
+    const token = crypto.randomBytes(24).toString('base64url');
+    this.accessTokens.set(token, now + ttl);
+    return token;
+  }
+
+  /** Drops expired minted tokens; called on mint and on every consumption. */
+  private pruneAccessTokens(now: number): void {
+    for (const [token, expiresAt] of this.accessTokens) {
+      if (expiresAt <= now) this.accessTokens.delete(token);
+    }
+  }
+
+  /**
+   * Validates and consumes a minted token: a second request with the same value finds
+   * nothing and is rejected. Returns false for unknown, already used or expired tokens.
+   */
+  private consumeAccessToken(candidate: string | null): boolean {
+    if (candidate === null || candidate.length === 0) return false;
+    const now = Date.now();
+    this.pruneAccessTokens(now);
+    const expiresAt = this.accessTokens.get(candidate);
+    if (expiresAt === undefined) return false;
+    // Single use: delete before returning, whatever the expiry outcome.
+    this.accessTokens.delete(candidate);
+    return expiresAt > now;
+  }
+
   private async startHttpServer(): Promise<() => Promise<void>> {
     if (!this.enabled) {
       this.log.info('Веб-панель отключена в конфиге');
@@ -386,6 +444,8 @@ export class WebDashboardService extends Service {
 
   private async stopHttpServer(server: Server): Promise<void> {
     this.boundPort = null;
+    // Links minted for the old socket are useless once the port is gone.
+    this.accessTokens.clear();
     this.closeAllStreams();
     // Let the SSE shutdown frames reach the sockets before tearing them down.
     await new Promise<void>((resolve) => {
@@ -536,13 +596,21 @@ export class WebDashboardService extends Service {
       const queryToken = url.searchParams.get('token');
       const authorizedByQuery =
         this.token.length > 0 && queryToken !== null && safeEqual(queryToken, this.token);
+      // A minted token is accepted exactly like the shared one, but only once: the link
+      // usually comes from a chat where it would otherwise stay valid forever.
+      const authorizedByMinted = !authorizedByQuery && this.consumeAccessToken(queryToken);
 
-      if (!authorizedByQuery && !this.isAuthorized(req)) {
+      if (!authorizedByQuery && !authorizedByMinted && !this.isAuthorized(req)) {
         this.sendHtml(res, 401, renderUnauthorized());
         return;
       }
       if (authorizedByQuery) {
         res.setHeader('Set-Cookie', this.buildTokenCookie());
+      } else if (authorizedByMinted && this.token.length > 0) {
+        // Session cookie: the browser keeps the session for navigation but forgets the
+        // credential on close, unlike the seven-day cookie of the shared token. Without a
+        // shared token (loopback-only mode) there is nothing to remember.
+        res.setHeader('Set-Cookie', this.buildSessionTokenCookie());
       }
 
       await this.route(req, res, url);
@@ -566,6 +634,11 @@ export class WebDashboardService extends Service {
 
   private buildTokenCookie(): string {
     return `${TOKEN_COOKIE_NAME}=${encodeURIComponent(this.token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800`;
+  }
+
+  /** Same credential, no Max-Age: it must die with the browser session. */
+  private buildSessionTokenCookie(): string {
+    return `${TOKEN_COOKIE_NAME}=${encodeURIComponent(this.token)}; HttpOnly; SameSite=Lax; Path=/`;
   }
 
   private async route(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {

@@ -15,6 +15,7 @@ import {
   type BootMarker,
 } from '@pkh/core';
 import { createApplication, runDryRunSimulation } from './bootstrap.js';
+import { buildDoctorReport } from './doctor.js';
 
 interface ParsedArgs {
   command: string;
@@ -24,7 +25,7 @@ interface ParsedArgs {
 
 /** Флаги, которым требуется значение. Всё, что не перечислено, считается опечаткой. */
 const VALUE_FLAGS = new Set(['data-dir', 'plugins-dir', 'from', 'web-port', 'web-host', 'web-token']);
-const BOOLEAN_FLAGS = new Set(['dry-run', 'simulate', 'no-telegram', 'web', 'help']);
+const BOOLEAN_FLAGS = new Set(['dry-run', 'simulate', 'no-telegram', 'web', 'help', 'json']);
 
 function parseArgs(argv: string[]): ParsedArgs {
   const args = argv.slice(2);
@@ -98,6 +99,7 @@ PlayerOK Harness (pkh) v${VERSION} — Cordis 4 + TypeScript
   --data-dir <путь>    Каталог для bot_settings/, bot_data/, logs/, plugins/
   --plugins-dir <путь> Каталог внешних плагинов
   --from <путь>        Исходный каталог для команды import-config
+  --json               Команда doctor: вывести отчёт одним JSON-объектом
   -h, --help           Показать справку
 `);
 }
@@ -156,62 +158,39 @@ async function runSetup(dataDir: string): Promise<void> {
   }
 }
 
-async function runDoctor(dataDir: string): Promise<void> {
-  const ctx = new Context();
-  await ctx.use(StorageService, { baseDir: dataDir });
-  const cfg = ctx.storage.getConfig();
+async function runDoctor(dataDir: string, pluginsDir: string | undefined, jsonOutput: boolean): Promise<void> {
+  const report = await buildDoctorReport(dataDir, { pluginsDir });
 
-  const checks: Array<[string, boolean, string]> = [
-    ['Node.js >= 20', Number(process.versions.node.split('.')[0]) >= 20, process.version],
-    ['Каталог данных', fs.existsSync(dataDir), dataDir],
-    ['Telegram Token', isTgTokenValid(cfg.telegram.api.token), cfg.telegram.api.token ? 'валидный формат' : 'не задан'],
-    ['PlayerOK Cookies', isCookiesValid(cfg.playerok.api.cookies), cfg.playerok.api.cookies ? 'валидный формат' : 'не заданы (используйте --dry-run для теста)'],
-    ['Владельцы Telegram', cfg.telegram.bot.signed_users.length > 0, `авторизовано: ${cfg.telegram.bot.signed_users.length}`],
-  ];
+  // --json is for machines: exactly one object on stdout, nothing else. Everything
+  // below renders the same data as before, so human output stays byte-identical.
+  if (jsonOutput) {
+    console.log(JSON.stringify(report, null, 2));
+    return;
+  }
 
-  console.log(`\n🩺 Диагностика PlayerOK Harness (pkh) v${VERSION}\n`);
-  for (const [label, ok, detail] of checks) {
-    console.log(`  ${ok ? '✅' : '⚠️'} ${label}: ${detail}`);
+  console.log(`\n🩺 Диагностика PlayerOK Harness (pkh) v${report.version}\n`);
+  for (const check of report.checks) {
+    console.log(`  ${check.ok ? '✅' : '⚠️'} ${check.label}: ${check.detail}`);
   }
 
   // Operational state that an operator needs before a restart, read without booting.
-  const queue = readQueueStats(dataDir);
+  const { queue } = report;
   if (queue) {
     console.log(
       `  ${queue.dead > 0 ? '⚠️' : '✅'} Очередь повторов: ожидает ${queue.pending}, в Dead-Letter ${queue.dead}`,
     );
   }
-  const markers = ctx.storage.get<{ action?: string }>('boot_marker');
-  if (markers?.action) {
-    console.log(`  ⚠️ Boot-маркер: «${markers.action}» (прошлый запуск не завершился штатно)`);
+  const { bootMarker } = report;
+  if (bootMarker) {
+    console.log(`  ⚠️ Boot-маркер: «${bootMarker.action}» (прошлый запуск не завершился штатно)`);
   }
-  const webPort = process.env.PKH_WEB_PORT ?? '8787';
-  const webOn = ['1', 'true', 'yes', 'on'].includes((process.env.PKH_WEB_ENABLED ?? '').toLowerCase());
-  const webToken = Boolean(process.env.PKH_WEB_TOKEN);
+  const webOn = report.web.enabled;
+  const webPort = report.web.port;
+  const webToken = report.web.tokenPresent;
   console.log(
     `  ${webOn ? '✅' : '⚠️'} Веб-панель: ${webOn ? `включена (порт ${webPort})` : 'выключена (--web или PKH_WEB_ENABLED=true)'}${webOn && !webToken ? ' — токен не задан, только loopback' : ''}`,
   );
   console.log('');
-  await ctx.fiber.dispose();
-}
-
-/** Reads bot_data/retry_queue.json without booting the app (doctor must stay offline). */
-function readQueueStats(dataDir: string): { pending: number; dead: number } | null {
-  try {
-    const file = path.join(dataDir, 'bot_data', 'retry_queue.json');
-    if (!fs.existsSync(file)) return null;
-    const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as {
-      tasks?: Array<{ status?: string }>;
-    };
-    const tasks = parsed.tasks ?? [];
-    let dead = 0;
-    for (const task of tasks) {
-      if (task.status === 'dead') dead += 1;
-    }
-    return { pending: tasks.length - dead, dead };
-  } catch {
-    return null;
-  }
 }
 
 function runPluginsList(dataDir: string, pluginsDir?: string): void {
@@ -307,7 +286,7 @@ async function main(): Promise<void> {
     return;
   }
   if (command === 'doctor') {
-    await runDoctor(dataDir);
+    await runDoctor(dataDir, pluginsDir, Boolean(flags.json));
     return;
   }
   if (command === 'plugins') {

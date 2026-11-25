@@ -5,7 +5,19 @@ import { pathToFileURL } from 'node:url';
 import { Context, Service, type Component, type Fiber } from 'cordis';
 import type { z } from 'zod';
 import type { BotConfig } from '../schemas/settings.js';
-import type { ExternalPluginMeta, LoadedPluginRecord, PluginCheckResult } from '../types/models.js';
+import type {
+  ExternalPluginMeta,
+  LoadedPluginRecord,
+  PluginCheckResult,
+  PluginIntegrityResult,
+} from '../types/models.js';
+import {
+  baselinePluginIntegrity,
+  forgetPluginIntegrity,
+  PLUGIN_INTEGRITY_MANIFEST_PATH,
+  recordPluginIntegrity,
+  verifyPluginIntegrity as verifyIntegrityOnDisk,
+} from './plugin-integrity.js';
 import type { StorageService } from './storage.js';
 
 export interface PluginManagerConfig {
@@ -148,6 +160,8 @@ export class PluginManagerService extends Service {
 
   public readonly pluginsDir: string;
   public readonly backupDir: string;
+  /** bot_data/plugin_integrity.json — the operator-visible pin of every plugin hash. */
+  public readonly integrityManifestPath: string;
   private readonly log;
   private readonly entries = new Map<string, ManagedPluginEntry>();
 
@@ -158,6 +172,7 @@ export class PluginManagerService extends Service {
       ? path.resolve(config.pluginsDir)
       : ctx.storage.resolvePath('plugins');
     this.backupDir = ctx.storage.resolvePath('bot_data/.plugins_backup');
+    this.integrityManifestPath = ctx.storage.resolvePath(PLUGIN_INTEGRITY_MANIFEST_PATH);
 
     ctx.effect(() => {
       return async () => {
@@ -338,8 +353,16 @@ export class PluginManagerService extends Service {
       }
 
       if (!entryFile || this.entries.has(id)) continue;
+      // First sighting of a file that was copied into plugins/ by hand: pin its hash
+      // so a later external edit is reported as a mismatch instead of silently
+      // becoming the new baseline.
+      this.pinIntegrityBaseline(id, entryFile);
       await this.importPluginFile(id, entryFile);
     }
+
+    // Loud but non-blocking: a modified .mjs loaded above still runs, yet the operator
+    // sees it in the log and, with bootReport mounted, in the boot report.
+    this.verifyPluginIntegrity();
 
     return this.list();
   }
@@ -422,6 +445,82 @@ export class PluginManagerService extends Service {
     });
   }
 
+  /**
+   * Recomputes the sha256 of every plugin file on disk and compares it with the pin
+   * recorded in bot_data/plugin_integrity.json.
+   *
+   * A mismatch does NOT block loading — a plugin the operator patched by hand keeps
+   * running — but it is logged as a warning and pushed into the boot report under the
+   * plugin id with stage 'load': a modified .mjs is exactly what an operator must see.
+   */
+  public verifyPluginIntegrity(): PluginIntegrityResult[] {
+    let results: PluginIntegrityResult[];
+    try {
+      results = verifyIntegrityOnDisk({
+        pluginsDir: this.pluginsDir,
+        manifestPath: this.integrityManifestPath,
+      });
+    } catch (err) {
+      this.log.warn(
+        `Не удалось проверить целостность плагинов: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return [];
+    }
+
+    const short = (hash: string | null): string => (hash ? `${hash.slice(0, 12)}…` : '—');
+
+    for (const result of results) {
+      if (result.state === 'mismatch') {
+        const text = `Файл плагина «${result.id}» изменён после установки (sha256 ${short(result.expected)} → ${short(result.actual)})`;
+        const trace = [
+          `Целостность плагина «${result.id}» нарушена: хэш файла не совпадает с зафиксированным в манифесте.`,
+          `  файл:       ${result.path ?? '—'}`,
+          `  ожидалось:  ${result.expected ?? '—'}`,
+          `  фактически: ${result.actual ?? '—'}`,
+          `  манифест:   ${this.integrityManifestPath}`,
+          'Загрузка плагина не блокируется, но файл мог быть подменён — проверьте его источник.',
+        ].join('\n');
+        this.log.warn(`${text}. Загрузка не блокируется, проверьте источник файла.`);
+        this.ctx.get('bootReport', false)?.addError(result.id, 'load', trace, text);
+      } else if (result.state === 'missing') {
+        this.log.warn(
+          `Файл плагина «${result.id}» исчез с диска, хотя его хэш зафиксирован в манифесте`,
+        );
+      } else if (result.state === 'unknown') {
+        this.log.info(
+          `Плагин «${result.id}» не имеет зафиксированного хэша — baseline будет записан при следующей загрузке`,
+        );
+      }
+    }
+
+    return results;
+  }
+
+  /** Pins a file only when the plugin has no pin yet (first discovery on disk). */
+  private pinIntegrityBaseline(id: string, filePath: string): void {
+    this.safeIntegrityWrite(id, () => baselinePluginIntegrity(this.integrityManifestPath, id, filePath));
+  }
+
+  /** Re-pins a file after an install or a rollback put known content on disk. */
+  private recordIntegrityHash(id: string, filePath: string): void {
+    this.safeIntegrityWrite(id, () => recordPluginIntegrity(this.integrityManifestPath, id, filePath));
+  }
+
+  private forgetIntegrityHash(id: string): void {
+    this.safeIntegrityWrite(id, () => forgetPluginIntegrity(this.integrityManifestPath, id));
+  }
+
+  /** The manifest must never break an install: a failed write is a warning, not a throw. */
+  private safeIntegrityWrite(id: string, action: () => unknown): void {
+    try {
+      action();
+    } catch (err) {
+      this.log.warn(
+        `Не удалось обновить манифест целостности плагина ${id}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   public async installPluginFile(
     filename: string,
     content: Buffer | string,
@@ -456,9 +555,12 @@ export class PluginManagerService extends Service {
     if (check.status !== 'ok') {
       if (existed && fs.existsSync(backupPath)) {
         fs.copyFileSync(backupPath, destPath);
+        // The rejected content never becomes a baseline: pin the restored bytes.
+        this.recordIntegrityHash(id, destPath);
         await this.importPluginFile(id, destPath, true);
       } else {
         fs.rmSync(destPath, { force: true });
+        this.forgetIntegrityHash(id);
       }
       return { id, check };
     }
@@ -467,6 +569,9 @@ export class PluginManagerService extends Service {
       fs.rmSync(backupPath, { force: true });
     }
 
+    // Only a file that passed the subprocess check and is now the live install may
+    // (re)define the expected hash; a hand edit on disk never does.
+    this.recordIntegrityHash(id, destPath);
     this.setPersistedDisabled(id, false);
     const record = await this.importPluginFile(id, destPath, true);
     return { id, check, record };
@@ -478,6 +583,7 @@ export class PluginManagerService extends Service {
       await entry.fiber.dispose();
     }
     this.entries.delete(id);
+    this.forgetIntegrityHash(id);
     this.setPersistedDisabled(id, false);
 
     // `id` comes from settings/UI callbacks; never let it escape pluginsDir.

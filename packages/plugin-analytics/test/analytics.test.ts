@@ -131,6 +131,10 @@ describe('@pkh/plugin-analytics persistent sales analytics', () => {
     );
 
     expect(analytics.getSummary({ period: 'all', now: NOW })).toEqual({
+      gross: 150,
+      fees: 0,
+      withdrawn: 0,
+      net: 150,
       revenue: 150,
       orders: 1,
       completed: 0,
@@ -146,8 +150,8 @@ describe('@pkh/plugin-analytics persistent sales analytics', () => {
       '2026-03-14',
       '2026-03-15',
     ]);
-    expect(series[2]).toEqual({ date: '2026-03-13', revenue: 150, orders: 1 });
-    expect(series[4]).toEqual({ date: '2026-03-15', revenue: 0, orders: 0 });
+    expect(series[2]).toEqual({ date: '2026-03-13', revenue: 150, orders: 1, net: 150 });
+    expect(series[4]).toEqual({ date: '2026-03-15', revenue: 0, orders: 0, net: 0 });
 
     expect(ctx.storage.getStorePath('analytics')).toBe(
       path.join(dir, 'bot_data', 'analytics.json'),
@@ -232,6 +236,7 @@ describe('@pkh/plugin-analytics persistent sales analytics', () => {
       date: '2026-03-14',
       revenue: 70,
       orders: 1,
+      net: 70,
     });
     expect(readStore(ctx).days['2026-03-14']?.cancelled).toBe(1);
   });
@@ -261,6 +266,10 @@ describe('@pkh/plugin-analytics persistent sales analytics', () => {
     expect(await analytics.backfill(NOW)).toEqual({ added: 2 });
     const first = analytics.getSummary({ period: 'all', now: NOW });
     expect(first).toEqual({
+      gross: 500,
+      fees: 0,
+      withdrawn: 0,
+      net: 500,
       revenue: 500,
       orders: 2,
       completed: 1,
@@ -292,6 +301,10 @@ describe('@pkh/plugin-analytics persistent sales analytics', () => {
     });
     await first.use(AnalyticsService);
     expect(first.analytics.getSummary({ period: 'all', now: NOW })).toEqual({
+      gross: 120,
+      fees: 0,
+      withdrawn: 0,
+      net: 120,
       revenue: 120,
       orders: 1,
       completed: 1,
@@ -347,6 +360,10 @@ describe('@pkh/plugin-analytics persistent sales analytics', () => {
       analytics.getSummary({ period, now: NOW });
 
     expect(summary('day')).toEqual({
+      gross: 100,
+      fees: 0,
+      withdrawn: 0,
+      net: 100,
       revenue: 100,
       orders: 1,
       completed: 0,
@@ -354,6 +371,10 @@ describe('@pkh/plugin-analytics persistent sales analytics', () => {
       avgOrder: 100,
     });
     expect(summary('week')).toEqual({
+      gross: 300,
+      fees: 0,
+      withdrawn: 0,
+      net: 300,
       revenue: 300,
       orders: 2,
       completed: 0,
@@ -365,6 +386,10 @@ describe('@pkh/plugin-analytics persistent sales analytics', () => {
     expect(month.orders).toBe(3);
     expect(month.avgOrder).toBeCloseTo(700 / 3, 10);
     expect(summary('all')).toEqual({
+      gross: 1500,
+      fees: 0,
+      withdrawn: 0,
+      net: 1500,
       revenue: 1500,
       orders: 4,
       completed: 0,
@@ -412,8 +437,8 @@ describe('@pkh/plugin-analytics persistent sales analytics', () => {
     );
     const seededStore: AnalyticsStore = {
       days: {
-        [oldKey]: { revenue: 5, orders: 1, completed: 0, cancelled: 0, items: {} },
-        [keptKey]: { revenue: 7, orders: 2, completed: 0, cancelled: 0, items: {} },
+        [oldKey]: { revenue: 5, orders: 1, completed: 0, cancelled: 0, fees: 0, withdrawn: 0, items: {} },
+        [keptKey]: { revenue: 7, orders: 2, completed: 0, cancelled: 0, fees: 0, withdrawn: 0, items: {} },
       },
       seenDeals: Array.from(
         { length: ANALYTICS_MAX_SEEN_DEALS + 3 },

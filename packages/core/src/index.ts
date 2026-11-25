@@ -20,5 +20,6 @@ export * from './services/lock.js';
 export * from './services/access.js';
 export * from './services/blacklist.js';
 export * from './services/plugin-manager.js';
+export * from './services/plugin-integrity.js';
 export * from './services/boot-report.js';
 export * from './services/updater.js';

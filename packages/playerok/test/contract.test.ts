@@ -210,6 +210,27 @@ function fullHandlers(): Record<string, () => unknown> {
         pageInfo: { endCursor: null, hasNextPage: false },
       },
     }),
+    SbpBankMembers: () => ({
+      sbpBankMembers: [
+        { id: 'sbp-1', name: 'Тинькофф', icon: 'https://playerok.com/sbp.png' },
+        { id: 'sbp-2', name: 'Сбербанк', icon: null },
+      ],
+    }),
+    verifiedCards: () => ({
+      verifiedCards: {
+        edges: [
+          {
+            node: {
+              id: 'card-1',
+              cardFirstSix: '411111',
+              cardLastFour: '1111',
+              cardType: 'VISA',
+              isChosen: true,
+            },
+          },
+        ],
+      },
+    }),
   };
 }
 
@@ -306,6 +327,17 @@ describe('GraphQL response-contract guard', () => {
     expect(transactions.items[0].fee).toBe(15);
     expect(transactions.items[0].account).toBe('acc-1');
 
+    const banks = await transport.getSbpBankMembers();
+    expect(banks).toEqual([
+      { id: 'sbp-1', name: 'Тинькофф', icon: 'https://playerok.com/sbp.png' },
+      { id: 'sbp-2', name: 'Сбербанк', icon: null },
+    ]);
+
+    const cards = await transport.getVerifiedCards();
+    expect(cards).toEqual([
+      { id: 'card-1', cardFirstSix: '411111', cardLastFour: '1111', cardType: 'VISA', isChosen: true },
+    ]);
+
     expect(transport.getContractIssues()).toEqual([]);
     await transport.close();
   });
@@ -397,6 +429,75 @@ describe('GraphQL response-contract guard', () => {
     });
     expect(mockCtx.playerok.getContractIssues()).toEqual([]);
     await mockCtx.fiber.dispose();
+
+    await transport.close();
+  });
+});
+
+describe('GraphQL query guard: SBP banks and verified cards', () => {
+  it('accepts both verifiedCards shapes (connection and bare array) without an issue', async () => {
+    const srv = await createContractServer({
+      verifiedCards: () => ({
+        verifiedCards: [{ id: 'card-2', cardFirstSix: '555555', cardLastFour: '4444' }],
+      }),
+    });
+    activeServers.push(srv);
+    const transport = makeTransport(srv);
+
+    const cards = await transport.getVerifiedCards();
+    expect(cards).toEqual([
+      { id: 'card-2', cardFirstSix: '555555', cardLastFour: '4444', cardType: null, isChosen: false },
+    ]);
+    expect(transport.getContractIssues()).toEqual([]);
+    await transport.close();
+  });
+
+  it('records exactly one issue for a drifted SBP bank member and still returns the list', async () => {
+    const handlers = fullHandlers();
+    // `id` renamed away: without the guard `String(m.id)` silently yields 'undefined'.
+    handlers.SbpBankMembers = () => ({ sbpBankMembers: [{ name: 'Тинькофф', icon: null }] });
+    const srv = await createContractServer(handlers);
+    activeServers.push(srv);
+    const transport = makeTransport(srv);
+
+    const banks = await transport.getSbpBankMembers();
+    expect(banks).toHaveLength(1);
+    expect(banks[0].name).toBe('Тинькофф');
+    expect(banks[0].icon).toBeNull();
+    expect(typeof banks[0].id).toBe('string');
+
+    const issues = transport.getContractIssues();
+    expect(issues).toHaveLength(1);
+    expect(issues[0].op).toBe('SbpBankMembers');
+    expect(issues[0].paths).toEqual(['sbpBankMembers.0.id']);
+    expect(issues[0].issueCount).toBe(1);
+    expect(issues[0].at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+
+    await transport.close();
+  });
+
+  it('records exactly one issue for a drifted verified card and still returns the card', async () => {
+    const handlers = fullHandlers();
+    handlers.verifiedCards = () => ({
+      verifiedCards: { edges: [{ node: { cardFirstSix: '411111', cardLastFour: '1111' } }] },
+    });
+    const srv = await createContractServer(handlers);
+    activeServers.push(srv);
+    const transport = makeTransport(srv);
+
+    const cards = await transport.getVerifiedCards();
+    expect(cards).toHaveLength(1);
+    expect(cards[0].cardFirstSix).toBe('411111');
+    expect(cards[0].cardLastFour).toBe('1111');
+    expect(typeof cards[0].id).toBe('string');
+
+    const issues = transport.getContractIssues();
+    expect(issues).toHaveLength(1);
+    expect(issues[0].op).toBe('verifiedCards');
+    // The envelope is a union of the connection and the bare array, so Zod reports
+    // one drift at the envelope key; the node-level detail stays in its nested errors.
+    expect(issues[0].paths).toEqual(['verifiedCards']);
+    expect(issues[0].issueCount).toBe(1);
 
     await transport.close();
   });

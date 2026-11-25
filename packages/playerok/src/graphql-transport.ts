@@ -57,11 +57,13 @@ import {
   reportDealProblemPayloadSchema,
   requestWithdrawalPayloadSchema,
   reviewsPayloadSchema,
+  sbpBankMembersPayloadSchema,
   transactionsPayloadSchema,
   updateDealPayloadSchema,
   updateItemPayloadSchema,
   uploadChatImagePayloadSchema,
   userPayloadSchema,
+  verifiedCardsPayloadSchema,
   viewerPayloadSchema,
   wsNextPayloadSchema,
   type ChatMessageNode,
@@ -73,6 +75,7 @@ import {
   type ProfileNode,
   type TransactionNode,
   type UserNode,
+  type VerifiedCardNode,
 } from './schemas.js';
 import type {
   BinaryUpload,
@@ -933,7 +936,11 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
   }
 
   public async getSbpBankMembers(): Promise<SbpBankMember[]> {
-    const data = await this.persistedQuery<{ sbpBankMembers: any[] }>('SbpBankMembers', {});
+    const data = this.guard(
+      'SbpBankMembers',
+      sbpBankMembersPayloadSchema,
+      await this.persistedQuery<unknown>('SbpBankMembers', {}),
+    );
     return (data.sbpBankMembers ?? []).map((m) => ({
       id: String(m.id),
       name: String(m.name ?? ''),
@@ -942,13 +949,23 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
   }
 
   public async getVerifiedCards(): Promise<VerifiedCard[]> {
-    const data = await this.persistedQuery<{ verifiedCards: any }>('verifiedCards', {
-      pagination: { first: 24, after: null },
-      sort: { direction: SortDirections.ASC },
-      field: 'createdAt',
-    });
-    const nodes = data.verifiedCards?.edges?.map((e: any) => e.node) ?? data.verifiedCards ?? [];
-    return nodes.map((c: any) => ({
+    const data = this.guard(
+      'verifiedCards',
+      verifiedCardsPayloadSchema,
+      await this.persistedQuery<unknown>('verifiedCards', {
+        pagination: { first: 24, after: null },
+        sort: { direction: SortDirections.ASC },
+        field: 'createdAt',
+      }),
+    );
+    const payload = data.verifiedCards;
+    // Both shapes the mapper has always accepted: a paginated connection and a bare array.
+    const nodes: VerifiedCardNode[] = Array.isArray(payload)
+      ? payload
+      : payload && Array.isArray(payload.edges)
+        ? payload.edges.map((edge) => edge.node)
+        : [];
+    return nodes.map((c) => ({
       id: String(c.id),
       cardFirstSix: String(c.cardFirstSix ?? ''),
       cardLastFour: String(c.cardLastFour ?? ''),

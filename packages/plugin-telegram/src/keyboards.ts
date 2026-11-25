@@ -137,7 +137,8 @@ export function renderMainMenu(dryRun = false, setupProblem: SetupProblem | null
     .text('━━━ СИСТЕМА ━━━', 'noop').row()
     .text('🔌 Плагины', 'menu:modules').text('🗒️ Логи', 'menu:logs').row()
     .text('🔁 Очередь повторов', 'menu:retry_queue').text('🔃 Обновления', 'menu:updates').row()
-    .text('🔑 Авторизации', 'menu:signed_users').text('🗂 Конфиги', 'menu:configs');
+    .text('🔑 Авторизации', 'menu:signed_users').text('🗂 Конфиги', 'menu:configs').row()
+    .text('🌐 Открыть дашборд', 'web:open');
   return { text, keyboard: kb };
 }
 
@@ -457,7 +458,12 @@ export function renderDeliveriesList(rules: AutoDeliveryRule[], page = 0): Rende
   const lines = slice.length
     ? slice.map((r, idx) => {
         const title = bindingLinks(r);
-        const kind = r.piece ? `📦 поштучно (ост: ${r.goods?.length ?? 0})` : '💬 сообщение';
+        // The sellable pool is only half the picture: a busy rule can have every key
+        // reserved for buyers while `goods` still looks almost full.
+        const stock = r.goods?.length ?? 0;
+        const reserved = r.reserved?.length ?? 0;
+        const counts = reserved > 0 ? `ост: ${stock}, в работе: ${reserved}` : `ост: ${stock}`;
+        const kind = r.piece ? `📦 поштучно (${counts})` : '💬 сообщение';
         return `${offset + idx + 1}. ${title} — ${kind}`;
       })
     : ['<i>Правил авто-выдачи пока нет.</i>'];
@@ -473,8 +479,14 @@ export function renderDeliveriesList(rules: AutoDeliveryRule[], page = 0): Rende
 }
 
 export function renderDeliveryDetail(index: number, rule: AutoDeliveryRule): RenderedView {
+  const goods = rule.goods ?? [];
+  const reserved = rule.reserved?.length ?? 0;
+  // In-flight keys are already promised to a buyer, so they are reported next to the
+  // sellable pool instead of being silently merged into it.
+  const reservedSuffix = reserved > 0 ? ` · в работе: <b>${reserved}</b>` : '';
+  const available = `Поштучных товаров: <b>${goods.length}</b>${reservedSuffix}`;
   const body = rule.piece
-    ? `Поштучных товаров: <b>${rule.goods?.length ?? 0}</b>\n${(rule.goods ?? []).slice(0, 5).map((g, i) => `${i + 1}. <code>${escapeHtml(g.slice(0, 48))}</code>`).join('\n') || '<i>Пусто</i>'}`
+    ? `${available}\n${goods.slice(0, 5).map((g, i) => `${i + 1}. <code>${escapeHtml(g.slice(0, 48))}</code>`).join('\n') || '<i>Пусто</i>'}`
     : `Текст выдачи:\n<blockquote>${escapeHtml((rule.message ?? []).join('\n') || '(пусто)')}</blockquote>`;
 
   const text = [

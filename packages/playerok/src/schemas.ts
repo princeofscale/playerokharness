@@ -402,6 +402,55 @@ export const transactionsPayloadSchema = z.looseObject({
   }),
 });
 
+/**
+ * Raw SBP bank member node. `getSbpBankMembers` keys the list on `id`
+ * (`String(m.id)`), so a renamed id used to become the literal string
+ * 'undefined' in every row with no signal at all.
+ */
+export const sbpBankMemberNodeSchema = z.looseObject({
+  id: z.string(),
+  name: z.string().nullish(),
+  icon: z.string().nullish(),
+});
+
+export type SbpBankMemberNode = z.infer<typeof sbpBankMemberNodeSchema>;
+
+/** `SbpBankMembers` persisted query: the whole list, never a single node. */
+export const sbpBankMembersPayloadSchema = z.looseObject({
+  sbpBankMembers: z.array(sbpBankMemberNodeSchema).nullable(),
+});
+
+/**
+ * Raw verified card node: `getVerifiedCards` keys each card on `id` and on the
+ * two card-number halves, all of which `String(c.x ?? '')` degraded to '' on drift.
+ */
+export const verifiedCardNodeSchema = z.looseObject({
+  id: z.string(),
+  cardFirstSix: z.string(),
+  cardLastFour: z.string(),
+  cardType: z.string().nullish(),
+  isChosen: z.boolean().nullish(),
+});
+
+export type VerifiedCardNode = z.infer<typeof verifiedCardNodeSchema>;
+
+const verifiedCardsConnectionSchema = z.looseObject({
+  edges: z.array(z.looseObject({ node: verifiedCardNodeSchema })),
+});
+
+export type VerifiedCardsConnection = z.infer<typeof verifiedCardsConnectionSchema>;
+
+/**
+ * `verifiedCards` persisted query. The mapper accepts both the paginated
+ * connection (`{ edges: [{ node }] }`) and a bare array, so the envelope accepts
+ * both; `nullable()` tolerates an empty result while a renamed key is reported.
+ */
+export const verifiedCardsPayloadSchema = z.looseObject({
+  verifiedCards: z
+    .union([verifiedCardsConnectionSchema, z.array(verifiedCardNodeSchema)])
+    .nullable(),
+});
+
 /*
  * Mutation envelopes.
  *

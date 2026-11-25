@@ -2,9 +2,12 @@ import {
   Context,
   ItemDealStatuses,
   Service,
+  TransactionOperations,
+  TransactionStatuses,
   z,
   type CachedOrders,
   type ItemDeal,
+  type Transaction,
 } from '@pkh/core';
 import '@pkh/adapter';
 
@@ -12,7 +15,10 @@ import '@pkh/adapter';
 export const ANALYTICS_STORE_KEY = 'analytics';
 /** Day buckets older than this many days are pruned on every mutation. */
 export const ANALYTICS_RETENTION_DAYS = 400;
-/** Upper bound on the idempotency marker list (oldest markers are dropped first). */
+/**
+ * Upper bound on the idempotency marker list (oldest markers are dropped first).
+ * Order, status, fee and withdrawal markers share this one list.
+ */
 export const ANALYTICS_MAX_SEEN_DEALS = 5000;
 
 const DAY_MS = 86_400_000;
@@ -28,6 +34,10 @@ export const AnalyticsDaySchema = z.object({
   orders: z.number().int().nonnegative().default(0),
   completed: z.number().int().nonnegative().default(0),
   cancelled: z.number().int().nonnegative().default(0),
+  /** Commission/fee amounts paid on transactions bucketed into this day. */
+  fees: z.number().nonnegative().default(0),
+  /** Money moved out of the balance (withdrawals) bucketed into this day. */
+  withdrawn: z.number().nonnegative().default(0),
   items: z.record(z.string(), AnalyticsItemSchema).default({}),
 });
 
@@ -51,6 +61,15 @@ export interface AnalyticsStatsOptions {
 }
 
 export interface AnalyticsSummary {
+  /** Gross sale revenue before fees and withdrawals; same number as `revenue`. */
+  gross: number;
+  /** Commission/fee amounts accumulated from transactions in the window. */
+  fees: number;
+  /** Money moved out of the balance (withdrawals) in the window. */
+  withdrawn: number;
+  /** `gross - fees - withdrawn`. */
+  net: number;
+  /** Legacy alias of {@link gross}; kept for existing dashboard/panel consumers. */
   revenue: number;
   orders: number;
   completed: number;
@@ -69,6 +88,8 @@ export interface AnalyticsSeriesPoint {
   date: string;
   revenue: number;
   orders: number;
+  /** `revenue - fees - withdrawn` for that day. */
+  net: number;
 }
 
 export interface AnalyticsBackfillResult {
@@ -135,6 +156,15 @@ export function statusMarker(kind: AnalyticsStatusKind, dealId: string): string 
   return `${kind}:${dealId}`;
 }
 
+/**
+ * Idempotency marker for "this transaction's fee/withdrawal was already counted".
+ * One namespace covers both the transaction object and the bare withdrawal event:
+ * the same transaction replayed through either path is counted exactly once.
+ */
+export function transactionMarker(transactionId: string): string {
+  return `transaction:${transactionId}`;
+}
+
 export function statusKind(status: string | null | undefined): AnalyticsStatusKind | null {
   if (!status) return null;
   if (COMPLETED_STATUSES.has(status)) return 'completed';
@@ -143,7 +173,7 @@ export function statusKind(status: string | null | undefined): AnalyticsStatusKi
 }
 
 function emptyDay(): AnalyticsDay {
-  return { revenue: 0, orders: 0, completed: 0, cancelled: 0, items: {} };
+  return { revenue: 0, orders: 0, completed: 0, cancelled: 0, fees: 0, withdrawn: 0, items: {} };
 }
 
 function ensureDay(store: AnalyticsStore, dayKey: string): AnalyticsDay {
@@ -163,6 +193,24 @@ function markSeen(store: AnalyticsStore, seen: Set<string>, marker: string): voi
 function finitePrice(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
+
+/**
+ * Non-negative money amount. A missing/garbled fee degrades to 0, and a negative
+ * value can never push a day bucket out of its `nonnegative()` schema contract.
+ */
+function positiveAmount(value: unknown): number {
+  const amount = finitePrice(value);
+  return amount > 0 ? amount : 0;
+}
+
+/**
+ * Terminal-failure statuses: a rolled-back or failed transaction never moved
+ * money, so neither its fee nor its value is counted.
+ */
+const IGNORED_TRANSACTION_STATUSES: ReadonlySet<string> = new Set<string>([
+  TransactionStatuses.ROLLED_BACK,
+  TransactionStatuses.FAILED,
+]);
 
 /**
  * Bucket for a deal/cached order: its own `createdAt` day when that day is
@@ -246,6 +294,14 @@ export class AnalyticsService extends Service {
         }),
         ctx.on('bot/init', async () => {
           await this.runSafely('бэкфилл по bot/init', () => this.backfill());
+          await this.runSafely('бэкфилл транзакций по bot/init', () => this.backfillTransactions());
+        }),
+        // The one withdrawal signal the core event map actually carries: a
+        // WITHDRAW transaction id plus its amount. `playerok/new-transaction`
+        // does not exist in @pkh/core, so fee-bearing transactions reach the
+        // store through the public recordTransaction() API instead.
+        ctx.on('withdrawal/requested', async (info) => {
+          await this.runSafely(`списание ${info.transactionId}`, () => this.recordWithdrawal(info));
         }),
       ];
 
@@ -254,6 +310,7 @@ export class AnalyticsService extends Service {
         // whichever comes first fills the gap, the other finds nothing to add.
         // Awaiting it here means ctx.use() resolves with the numbers already filled in.
         await this.runSafely('бэкфилл при старте', () => this.backfill());
+        await this.runSafely('бэкфилл транзакций при старте', () => this.backfillTransactions());
       }
 
       return () => {
@@ -347,6 +404,66 @@ export class AnalyticsService extends Service {
   }
 
   /**
+   * Counts one transaction into the day bucket of its own `createdAt`:
+   * its commission into `fees`, and a WITHDRAW's value into `withdrawn`.
+   * Rolled-back/failed transactions never moved money and are skipped.
+   */
+  private applyTransaction(
+    store: AnalyticsStore,
+    seen: Set<string>,
+    at: Date,
+    tx: Transaction,
+  ): boolean {
+    if (!tx?.id) return false;
+    const marker = transactionMarker(tx.id);
+    if (seen.has(marker)) return false;
+    if (IGNORED_TRANSACTION_STATUSES.has(tx.status)) return false;
+
+    const bucket = ensureDay(store, dayKeyFor(tx.createdAt, at));
+    let counted = false;
+
+    const fee = positiveAmount(tx.fee);
+    if (fee > 0) {
+      bucket.fees += fee;
+      counted = true;
+    }
+    if (tx.operation === TransactionOperations.WITHDRAW) {
+      const withdrawn = positiveAmount(tx.value);
+      if (withdrawn > 0) {
+        bucket.withdrawn += withdrawn;
+        counted = true;
+      }
+    }
+
+    markSeen(store, seen, marker);
+    return counted;
+  }
+
+  /**
+   * Counts a bare withdrawal (the `withdrawal/requested` payload): shares the
+   * `transaction:` marker namespace with {@link applyTransaction}, so a
+   * transaction seen through both paths is still counted exactly once.
+   */
+  private applyWithdrawal(
+    store: AnalyticsStore,
+    seen: Set<string>,
+    at: Date,
+    transactionId: string,
+    amount: number,
+  ): boolean {
+    if (!transactionId) return false;
+    const marker = transactionMarker(transactionId);
+    if (seen.has(marker)) return false;
+
+    const withdrawn = positiveAmount(amount);
+    if (withdrawn <= 0) return false;
+
+    ensureDay(store, dayKeyFor(undefined, at)).withdrawn += withdrawn;
+    markSeen(store, seen, marker);
+    return true;
+  }
+
+  /**
    * Records one NEW_DEAL as an order. Returns false when the deal was already
    * counted (duplicate/new-deal replay) so callers can tell a no-op from a write.
    */
@@ -373,10 +490,66 @@ export class AnalyticsService extends Service {
   }
 
   /**
+   * Counts one transaction's fee and (for WITHDRAW) its amount exactly once.
+   * Returns true only when a number actually changed: a duplicate id, a
+   * rolled-back/failed transaction or a transaction with neither a fee nor a
+   * withdrawal is a no-op.
+   */
+  public async recordTransaction(tx: Transaction, now: Date = new Date()): Promise<boolean> {
+    if (!tx?.id) return false;
+    return this.mutate(now, (store, seen, at) => this.applyTransaction(store, seen, at, tx));
+  }
+
+  /**
+   * Counts a withdrawal announced through `withdrawal/requested` exactly once
+   * per transaction id. Idempotent, so an event replay cannot shrink net profit twice.
+   */
+  public async recordWithdrawal(
+    info: { transactionId: string; amount: number },
+    now: Date = new Date(),
+  ): Promise<boolean> {
+    if (!info?.transactionId) return false;
+    return this.mutate(now, (store, seen, at) =>
+      this.applyWithdrawal(store, seen, at, info.transactionId, info.amount),
+    );
+  }
+
+  /**
    * Adds every cached order that is not counted yet (revenue, orders, items and
    * its completed/cancelled status). Idempotent: markers make a second call over
    * the same cache a no-op, so it is safe on startup and on every bot/init.
    */
+  /**
+   * Fills fees and withdrawals from the transaction history once per start.
+   *
+   * @pkh/core has no `playerok/new-transaction` event, so without this the net profit
+   * of a fresh install stays at gross-0-0 until the first withdrawal happens live.
+   * Idempotent: every transaction is marked, so a second call is a no-op.
+   */
+  public async backfillTransactions(
+    count = 100,
+    now: Date = new Date(),
+  ): Promise<{ counted: number }> {
+    let page: { items: Transaction[] };
+    try {
+      page = await this.ctx.playerok.getTransactions(count);
+    } catch (err) {
+      this.log.warn(
+        `Бэкфилл транзакций недоступен: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return { counted: 0 };
+    }
+    let counted = 0;
+    for (const transaction of page.items) {
+      if (!transaction?.id) continue;
+      if (await this.recordTransaction(transaction, now)) counted += 1;
+    }
+    if (counted > 0) {
+      this.log.info(`Бэкфилл аналитики: учтено транзакций из истории — ${counted}`);
+    }
+    return { counted };
+  }
+
   public async backfill(now: Date = new Date()): Promise<AnalyticsBackfillResult> {
     let orders: CachedOrders;
     try {
@@ -439,27 +612,39 @@ export class AnalyticsService extends Service {
    * Synchronous summary over a calendar-aligned UTC window ending today:
    * `day` = today's bucket, `week` = last 7 day buckets, `month` = last 30,
    * `all` = every retained bucket.
+   *
+   * `gross` is the sale revenue before costs; `net = gross - fees - withdrawn`.
+   * `revenue` is kept as a legacy alias of `gross` so existing consumers of the
+   * pre-profit summary keep working unchanged.
    */
   public getSummary(options: AnalyticsStatsOptions): AnalyticsSummary {
     const now = options.now ?? new Date();
-    let revenue = 0;
+    let gross = 0;
+    let fees = 0;
+    let withdrawn = 0;
     let orders = 0;
     let completed = 0;
     let cancelled = 0;
 
     for (const bucket of this.selectBuckets(options.period, now)) {
-      revenue += bucket.revenue;
+      gross += bucket.revenue;
+      fees += bucket.fees;
+      withdrawn += bucket.withdrawn;
       orders += bucket.orders;
       completed += bucket.completed;
       cancelled += bucket.cancelled;
     }
 
     return {
-      revenue,
+      gross,
+      fees,
+      withdrawn,
+      net: gross - fees - withdrawn,
+      revenue: gross,
       orders,
       completed,
       cancelled,
-      avgOrder: orders > 0 ? revenue / orders : 0,
+      avgOrder: orders > 0 ? gross / orders : 0,
     };
   }
 
@@ -495,7 +680,10 @@ export class AnalyticsService extends Service {
     for (let offset = span - 1; offset >= 0; offset -= 1) {
       const date = analyticsDayKey(new Date(todayStart - offset * DAY_MS));
       const bucket = store.days[date];
-      series.push({ date, revenue: bucket?.revenue ?? 0, orders: bucket?.orders ?? 0 });
+      const gross = bucket?.revenue ?? 0;
+      const fees = bucket?.fees ?? 0;
+      const withdrawn = bucket?.withdrawn ?? 0;
+      series.push({ date, revenue: gross, orders: bucket?.orders ?? 0, net: gross - fees - withdrawn });
     }
     return series;
   }

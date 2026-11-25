@@ -28,6 +28,7 @@ import {
 } from '@pkh/core';
 import { mountAutomation, type TrackedPosition } from '@pkh/plugin-automation';
 import { RetryQueueService, type RetryTask } from '@pkh/plugin-retry-queue';
+import { WebDashboardService } from '@pkh/plugin-web';
 import { MockPlayerokTransport, PlayerokService } from '@pkh/adapter';
 import {
   CALLBACK_DATA_MAX_BYTES,
@@ -524,13 +525,27 @@ interface Harness {
   router: Router;
 }
 
+interface HarnessOptions {
+  /** Mount the real dashboard so a minted one-time link can be checked end to end. */
+  withDashboard?: boolean | 'disabled';
+}
+
+/** The dashboard binds its socket from a ctx.effect, so wait for the port before minting. */
+async function waitForDashboard(ctx: Context): Promise<void> {
+  const deadline = Date.now() + 1000;
+  while (Date.now() < deadline) {
+    if (ctx.get('webDashboard', false)?.url) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 /**
  * Full offline graph: every service the panel reads is mounted, so a screen that
  * touches playerok/automation/queue must render instead of throwing. A missing
  * service would surface as the Russian "service is not connected" error and fail
  * the routing test below.
  */
-async function createHarness(): Promise<Harness> {
+async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pkh-tg-cb-'));
   tempDirs.push(dir);
   const ctx = new Context();
@@ -544,6 +559,12 @@ async function createHarness(): Promise<Harness> {
   });
   await ctx.use(RetryQueueService, { enableTimer: false });
   mountAutomation(ctx, { enableTimers: false });
+  if (options.withDashboard) {
+    // Real service, loopback-only, short-lived token auth: the same path production uses.
+    const enabled = options.withDashboard !== 'disabled';
+    await ctx.use(WebDashboardService, { enabled, port: 0, token: 'panel-test-token' });
+    if (enabled) await waitForDashboard(ctx);
+  }
   await ctx.use(TelegramService, { token: '' });
   ctx.access.addSignedUser(USER_ID);
   ctx.access.addSignedUser(OTHER_USER_ID);
@@ -742,3 +763,206 @@ describe('legacy admin password rate limit', () => {
     expect(limiter.failures(1)).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 8. Dashboard button and retry-queue delete guard
+// ---------------------------------------------------------------------------
+
+describe('dashboard access from the panel', () => {
+  it('replies with a working one-time dashboard URL when the web panel is mounted', async () => {
+    const { ctx, router } = await createHarness({ withDashboard: true });
+    try {
+      const baseUrl = ctx.get('webDashboard', false)?.url ?? '';
+      expect(baseUrl).toContain('http://127.0.0.1:');
+
+      const gctx = await dispatch(router, 'web:open');
+      const reply = gctx.replies.join('\n');
+      expect(gctx.staleAnswers).toEqual([]);
+      expect(reply).toContain(baseUrl);
+      expect(reply).toContain('/?token=');
+
+      const token = /[?&]token=([A-Za-z0-9_-]+)/.exec(reply)?.[1] ?? '';
+      expect(token.length).toBeGreaterThan(20);
+
+      // The minted link authenticates the real dashboard exactly once.
+      expect((await fetch(`${baseUrl}/?token=${token}`)).status).toBe(200);
+      expect((await fetch(`${baseUrl}/?token=${token}`)).status).toBe(401);
+
+      // A second press mints a different link instead of reusing the spent one.
+      const again = await dispatch(router, 'web:open');
+      expect(again.replies.join('\n')).not.toBe(reply);
+    } finally {
+      await ctx.fiber.dispose();
+    }
+  });
+
+  it('explains when the web panel is mounted but disabled', async () => {
+    const { ctx, router } = await createHarness({ withDashboard: 'disabled' });
+    try {
+      const dashboard = ctx.get('webDashboard', false);
+      expect(dashboard).toBeDefined();
+      expect(dashboard?.address).toBeNull();
+
+      const gctx = await dispatch(router, 'web:open');
+      expect(gctx.staleAnswers).toEqual([]);
+      expect(gctx.replies.join('\n')).toContain('Веб-панель отключена');
+    } finally {
+      await ctx.fiber.dispose();
+    }
+  });
+
+  it('explains instead of throwing when the web panel is absent', async () => {
+    const { ctx, router } = await createHarness();
+    try {
+      expect(ctx.get('webDashboard', false)).toBeUndefined();
+
+      const gctx = await dispatch(router, 'web:open');
+      expect(gctx.staleAnswers).toEqual([]);
+      expect(gctx.answers).toHaveLength(1);
+      expect(gctx.replies.join('\n')).toContain('Веб-панель не подключена');
+    } finally {
+      await ctx.fiber.dispose();
+    }
+  });
+});
+
+describe('retry queue rendering', () => {
+  it('counts a processing task and keeps the pending/DLQ counters intact', () => {
+    const tasks: RetryTask[] = [
+      {
+        id: 'p-1',
+        kind: 'send_message',
+        payload: {},
+        attempts: 1,
+        maxAttempts: 5,
+        nextRunAt: ISO,
+        createdAt: ISO,
+        status: 'processing',
+      },
+      {
+        id: 'p-2',
+        kind: 'bump_item',
+        payload: {},
+        attempts: 0,
+        maxAttempts: 5,
+        nextRunAt: ISO,
+        createdAt: ISO,
+        status: 'pending',
+      },
+      {
+        id: 'p-3',
+        kind: 'update_deal',
+        payload: {},
+        attempts: 5,
+        maxAttempts: 5,
+        nextRunAt: ISO,
+        createdAt: ISO,
+        status: 'dead',
+      },
+    ];
+
+    const view = renderRetryQueue(tasks);
+    // The substrings the root suite asserts must survive the processing polish.
+    expect(view.text).toContain('В ожидании (pending): <b>1</b>');
+    expect(view.text).toContain('Dead-Letter (DLQ): <b>1</b>');
+    expect(view.text).toContain('выполняется: <b>1</b>');
+    expect(view.text).toContain('⚙️');
+  });
+});
+
+describe('retry queue delete guard', () => {
+  it('refuses to delete a task that is processing right now', async () => {
+    const { ctx, router } = await createHarness();
+    try {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      ctx.retryQueue.registerHandler('slow_task', async () => {
+        await gate;
+      });
+      const task = await ctx.retryQueue.enqueue({
+        kind: 'slow_task',
+        payload: {},
+        initialDelayMs: 0,
+      });
+
+      // Claim the task without awaiting the pass: it stays 'processing' until released.
+      let passError: unknown;
+      const pass = ctx.retryQueue.processDue().catch((err: unknown) => {
+        passError = err;
+      });
+      const deadline = Date.now() + 1000;
+      while (Date.now() < deadline) {
+        if (ctx.retryQueue.list().some((t) => t.id === task.id && t.status === 'processing')) break;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(ctx.retryQueue.list().find((t) => t.id === task.id)?.status).toBe('processing');
+
+      const gctx = await dispatch(router, `rq:del:${task.id}`);
+      expect(gctx.answers[0]?.text ?? '').toContain('выполняется');
+      // The task survived the refused delete and the panel was re-rendered.
+      expect(ctx.retryQueue.list().some((t) => t.id === task.id)).toBe(true);
+      expect(gctx.replies.join('\n')).toContain('Очередь повторов');
+
+      release();
+      await pass;
+      expect(passError).toBeUndefined();
+      // The attempt finished: the task is done and removed, not stuck in the queue.
+      expect(ctx.retryQueue.list().some((t) => t.id === task.id)).toBe(false);
+    } finally {
+      await ctx.fiber.dispose();
+    }
+  });
+});
+describe('auto-delivery stock inventory', () => {
+  it('reports the sellable pool and the in-flight reservations', () => {
+    const reserved = [
+      { good: 'KEY-BUSY-1', dealId: 'deal-1', at: ISO },
+      { good: 'KEY-BUSY-2', dealId: 'deal-2', at: ISO },
+    ];
+    const rule: AutoDeliveryRule = {
+      keyphrases: ['steam'],
+      piece: true,
+      goods: Array.from({ length: 20 }, (_, index) => 'KEY-' + String(index + 1)),
+      reserved,
+    };
+
+    const list = renderDeliveriesList([rule], 0);
+    expect(list.text).toContain('ост: 20');
+    expect(list.text).toContain('в работе: 2');
+
+    const detail = renderDeliveryDetail(0, rule);
+    expect(detail.text).toContain('Поштучных товаров: <b>20</b>');
+    expect(detail.text).toContain('в работе: <b>2</b>');
+
+    // A rule without reservations keeps the compact pre-reserved-pool wording.
+    const plain = renderDeliveryDetail(0, { keyphrases: ['steam'], piece: true, goods: ['A'] });
+    expect(plain.text).toContain('Поштучных товаров: <b>1</b>');
+    expect(plain.text).not.toContain('в работе');
+  });
+
+  it('clears the sellable pool and the reservations together', async () => {
+    const { ctx, router } = await createHarness();
+    try {
+      ctx.storage.update<AutoDeliveryRule[]>('auto_deliveries', (list) => {
+        list.push({
+          keyphrases: ['steam'],
+          piece: true,
+          goods: ['KEY-A', 'KEY-B'],
+          reserved: [{ good: 'KEY-BUSY', dealId: 'deal-busy', at: ISO }],
+        });
+      });
+
+      const gctx = await dispatch(router, 'deliv:clear_goods:0');
+      expect(gctx.answers[0]?.text ?? '').toContain('резерв');
+
+      const rule = ctx.storage.getAutoDeliveries()[0];
+      expect(rule?.goods).toEqual([]);
+      expect(rule?.reserved).toEqual([]);
+    } finally {
+      await ctx.fiber.dispose();
+    }
+  });
+});
+

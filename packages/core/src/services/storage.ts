@@ -51,6 +51,13 @@ export interface StoreSpec<T> {
   exportable: boolean;
 }
 
+interface StoreCacheEntry {
+  mtimeNs: bigint;
+  size: bigint;
+  revision: number;
+  value: unknown;
+}
+
 const clone = <T>(value: T): T => structuredClone(value);
 
 function deepMergeWithDefaults<T>(current: unknown, defaults: T): T {
@@ -218,6 +225,16 @@ export class StorageService extends Service {
   private readonly specs: Map<string, StoreSpec<unknown>> = new Map();
   private readonly queues: Map<string, Promise<unknown>> = new Map();
   private readonly recoveredStores = new Set<string>();
+
+  /**
+   * Parsed-store cache: getConfig()/getMessages() run on every menu keystroke and each
+   * call used to JSON.parse the file again. An entry stays valid while the file's
+   * nanosecond mtime, its byte size and the in-process revision counter all match —
+   * so a set() is visible on the very next read and an external edit is picked up.
+   */
+  public readonly storeCache = { hits: 0, misses: 0, writes: 0 };
+  private readonly cache = new Map<string, StoreCacheEntry>();
+  private readonly revisions = new Map<string, number>();
 
   constructor(ctx: Context, config: StorageConfig) {
     super(ctx, 'storage');
@@ -428,16 +445,63 @@ export class StorageService extends Service {
     return this.resolvePath(spec.relativePath);
   }
 
+  private statSignature(filePath: string): { mtimeNs: bigint; size: bigint } | null {
+    try {
+      const stat = fs.statSync(filePath, { bigint: true });
+      return { mtimeNs: stat.mtimeNs, size: stat.size };
+    } catch {
+      return null;
+    }
+  }
+
+  private rememberParsed(name: string, filePath: string, value: unknown): void {
+    const signature = this.statSignature(filePath);
+    if (!signature) {
+      this.cache.delete(name);
+      return;
+    }
+    this.cache.set(name, {
+      mtimeNs: signature.mtimeNs,
+      size: signature.size,
+      revision: this.revisions.get(name) ?? 0,
+      value,
+    });
+  }
+
   public get<T>(name: string): T {
     const spec = this.specs.get(name);
     if (!spec) throw new Error(`Unknown storage key: ${name}`);
-    return readJsonSafe(
-      this.resolvePath(spec.relativePath),
+
+    const filePath = this.resolvePath(spec.relativePath);
+    const revision = this.revisions.get(name) ?? 0;
+    const cached = this.cache.get(name);
+    const signature = this.statSignature(filePath);
+
+    if (
+      cached &&
+      signature &&
+      cached.revision === revision &&
+      cached.mtimeNs === signature.mtimeNs &&
+      cached.size === signature.size
+    ) {
+      this.storeCache.hits += 1;
+      // Callers mutate what they get back (update(), rebindItem(), getConfig()+setConfig),
+      // so a cached object is never handed out by reference.
+      return clone(cached.value) as T;
+    }
+
+    this.storeCache.misses += 1;
+    const parsed = readJsonSafe(
+      filePath,
       spec.schema as z.ZodType<T>,
       spec.defaultValue as () => T,
       spec.restoreMissing,
       (reason) => this.reportRecovery(name, reason),
     );
+    // Re-stat after the read: readJsonSafe rewrites the file for corrupt or
+    // restoreMissing stores, so the signature must be taken from the final bytes.
+    this.rememberParsed(name, filePath, clone(parsed));
+    return parsed;
   }
 
   /**
@@ -459,7 +523,13 @@ export class StorageService extends Service {
     if (!spec) throw new Error(`Unknown storage key: ${name}`);
     const safeValue = name === 'config' ? (stripEnvSecrets(value as BotConfig) as unknown as T) : value;
     const parsed = (spec.schema as z.ZodType<T>).parse(safeValue);
-    writeJsonAtomic(this.resolvePath(spec.relativePath), parsed);
+    const filePath = this.resolvePath(spec.relativePath);
+    writeJsonAtomic(filePath, parsed);
+    // mtime/size change on every write; the revision counter additionally covers
+    // rewriting identical bytes on a filesystem with a coarse mtime.
+    this.revisions.set(name, (this.revisions.get(name) ?? 0) + 1);
+    this.storeCache.writes += 1;
+    this.rememberParsed(name, filePath, clone(parsed));
     return parsed;
   }
 

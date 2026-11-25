@@ -322,3 +322,38 @@ export interface PluginCheckResult {
   trace?: string;
   hasBackup: boolean;
 }
+
+/**
+ * One pinned plugin file in bot_data/plugin_integrity.json. Written by
+ * installPluginFile() and, for plugins already on disk, by the first discovery.
+ */
+export interface PluginIntegrityEntry {
+  sha256: string;
+  size: number;
+  /** ISO timestamp of the install/discovery that pinned this hash. */
+  installedAt: string;
+  /** Absolute path the hash was taken from. */
+  file: string;
+}
+
+/**
+ * ok      — hash on disk equals the pinned hash
+ * mismatch— pinned hash differs (file was modified outside the manager)
+ * unknown — a plugin file exists but no hash was ever pinned for it
+ * missing — a hash is pinned but the file is gone
+ */
+export type PluginIntegrityState = 'ok' | 'mismatch' | 'missing' | 'unknown';
+
+export interface PluginIntegrityResult {
+  id: string;
+  /** Pinned sha256, or null when the plugin was never recorded. */
+  expected: string | null;
+  /** sha256 of the file currently on disk, or null when it cannot be read. */
+  actual: string | null;
+  /** True only for an exact match; a mismatch, unknown or missing file is never ok. */
+  ok: boolean;
+  state: PluginIntegrityState;
+  path?: string;
+  size?: number;
+  installedAt?: string;
+}

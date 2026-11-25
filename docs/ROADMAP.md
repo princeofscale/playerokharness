@@ -172,3 +172,31 @@ Still open from section 3: SQLite persistence, a stock model with reserved/sold 
 
 Still open: SQLite persistence, a stock model with reserved/sold states, @grammyjs/runner,
 plugin manifest/signature, and net-profit tracking (revenue is gross today).
+
+## 7. Round 4 (2026-11-25) — shipped
+
+- **Stock reservation model** (money safety): AutoDeliveryRule gained an optional
+  `reserved: [{good, dealId, at}]` pool. A key is moved out of `goods` and reserved for the
+  deal BEFORE the network send, settled on success, returned on a failed hand-off, and
+  released by a TTL sweep only when no live retry task still owns it. The store-wide
+  `runExclusive` around the network call is gone: independent deals now send concurrently.
+  A queued retry that finally succeeds settles its reservation immediately.
+- **Net profit analytics**: fees and withdrawals are tracked per day, `getSummary()`
+  exposes gross/fees/withdrawn/net, and a bounded transaction backfill fills the numbers
+  on a fresh install (no `playerok/new-transaction` event exists yet).
+- **Plugin integrity manifest** (bot_data/plugin_integrity.json): sha256 per external
+  plugin, pinned on install/discovery. A modified file is reported as `mismatch` in the log,
+  the boot report and `pkh doctor --json`; a hand-copied plugin is `unknown`, never `ok`.
+  Loading is not blocked (the plugin can still be inspected/repaired), but it is loud.
+- **`pkh doctor --json`**: one object drives both the human output (byte-identical to
+  before) and the JSON report, including queue depth, boot marker, web state and plugin
+  integrity.
+- **Parsed-store cache**: StorageService caches parsed stores keyed by mtimeNs+size and a
+  per-store revision, so `getConfig()`/`getCachedOrders()` stop re-parsing multi-KB JSON on
+  every event while staying correct for external edits.
+- **Retry queue**: leases are renewed while a handler runs (a slow API call can no longer be
+  reclaimed and executed twice), and `request_withdrawal` is a built-in at-least-once
+  handler so a transient 502 no longer burns a whole withdrawal window.
+
+Still open: SQLite persistence, `@grammyjs/runner`, telemetry/metrics, i18n of panel
+strings, and a stock screen that separates available vs in-flight inventory (next round).

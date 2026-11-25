@@ -2,7 +2,7 @@ import type { Context } from '@pkh/core';
 import { ordersCachePlugin } from './plugins/orders-cache.js';
 import { blacklistPlugin } from './plugins/blacklist.js';
 import { messagesPlugin } from './plugins/messages.js';
-import { autoDeliveryPlugin } from './plugins/auto-delivery.js';
+import { AutoDeliveryService, type AutoDeliveryConfig } from './plugins/auto-delivery.js';
 import { autoCompletePlugin } from './plugins/auto-complete.js';
 import { AutoRestoreService, type AutoRestoreConfig } from './plugins/auto-restore.js';
 import { AutoBumpService, type AutoBumpConfig } from './plugins/auto-bump.js';
@@ -21,6 +21,7 @@ export * from './plugins/notifications.js';
 
 export interface AutomationBundleConfig {
   enableTimers?: boolean;
+  delivery?: AutoDeliveryConfig;
   restore?: AutoRestoreConfig;
   bump?: AutoBumpConfig;
   withdrawal?: AutoWithdrawalConfig;
@@ -40,7 +41,9 @@ export function mountAutomation(ctx: Context, config: AutomationBundleConfig = {
   ctx.use(ordersCachePlugin);
   ctx.use(blacklistPlugin);
   ctx.use(messagesPlugin);
-  ctx.use(autoDeliveryPlugin);
+  // The piece-by-piece stock needs a root-level service: the stale-reservation sweep is
+  // part of its public API, and a service provided by a nested plugin is invisible here.
+  ctx.use(AutoDeliveryService, { enableTimer: enableTimers, ...config.delivery });
   ctx.use(autoCompletePlugin);
   ctx.use(AutoRestoreService, { enableTimer: enableTimers, ...config.restore });
   ctx.use(AutoBumpService, { enableTimer: enableTimers, ...config.bump });
