@@ -29,6 +29,7 @@ import {
 import { GraphQLPlayerokTransport } from './graphql-transport.js';
 import { MockPlayerokTransport, type MockTransportSeed } from './mock-transport.js';
 import type { ContractIssue } from './schemas.js';
+import { emptyRequestStats } from './transport.js';
 import type {
   BinaryUpload,
   CreateItemParams,
@@ -36,6 +37,7 @@ import type {
   GetMyItemsParams,
   GetReviewsParams,
   PlayerokTransport,
+  RequestStats,
   RequestWithdrawalParams,
   UpdateItemParams,
 } from './transport.js';
@@ -518,6 +520,15 @@ export class PlayerokService extends Service {
    */
   public getContractIssues(): ContractIssue[] {
     return this.transport.getContractIssues?.() ?? [];
+  }
+
+  /**
+   * Outbound observability: requests per operation, failures per class, latency
+   * and the live throttle state. Zeroed when the active transport does not
+   * instrument itself (the mock used by `--dry-run` and tests).
+   */
+  public getRequestStats(): RequestStats {
+    return this.transport.getRequestStats?.() ?? emptyRequestStats();
   }
 }
 

@@ -28,6 +28,7 @@ import {
   type UserProfile,
   type VerifiedCard,
 } from '@pkh/core';
+import { emptyRequestStats } from './transport.js';
 import type {
   CreateItemParams,
   GetDealsParams,
@@ -35,6 +36,7 @@ import type {
   GetReviewsParams,
   PlayerokEventHandler,
   PlayerokTransport,
+  RequestStats,
   RequestWithdrawalParams,
   SendMessageParams,
   UpdateItemParams,
@@ -51,6 +53,14 @@ export interface MockTransportSeed {
 
 export class MockPlayerokTransport implements PlayerokTransport {
   public readonly kind = 'mock';
+
+  /**
+   * The mock leaves the process not at all: nothing is throttled and every
+   * counter stays zero. Present so callers can query stats unconditionally.
+   */
+  public getRequestStats(): RequestStats {
+    return emptyRequestStats();
+  }
 
   public account: AccountInfo;
   public readonly items = new Map<string, MyItem>();

@@ -40,6 +40,7 @@ import {
   UnauthorizedError,
 } from './errors.js';
 import { GQL_QUERIES, PERSISTED_QUERIES } from './queries.js';
+import { TokenBucket, type RateLimitOptions } from './rate-limit.js';
 import {
   chatMessagesPayloadSchema,
   chatPayloadSchema,
@@ -85,6 +86,8 @@ import type {
   GetReviewsParams,
   PlayerokEventHandler,
   PlayerokTransport,
+  RequestFailureClass,
+  RequestStats,
   RequestWithdrawalParams,
   SendMessageParams,
   UpdateItemParams,
@@ -100,7 +103,31 @@ export interface GraphQLTransportOptions {
   reviewPollIntervalMs?: number;
   newDealsPollIntervalMs?: number;
   wsPingIntervalMs?: number;
+  /**
+   * Outbound HTTP throttle (persisted GET, POST mutation, multipart upload,
+   * file download). `capacity: 0` disables it, e.g. in tests.
+   */
+  httpRateLimit?: RateLimitOptions;
+  /**
+   * Separate, smaller throttle for WS frames (subscriptions, ping, pong).
+   * `capacity: 0` disables it.
+   */
+  wsRateLimit?: RateLimitOptions;
 }
+
+/** Default HTTP budget: burst 12, sustained 6 requests/second. */
+export const DEFAULT_HTTP_RATE_LIMIT: Required<RateLimitOptions> = {
+  capacity: 12,
+  refillPerSecond: 6,
+  maxWaitMs: 30_000,
+};
+
+/** WS frames are subscription bookkeeping only: a smaller, separate budget. */
+export const DEFAULT_WS_RATE_LIMIT: Required<RateLimitOptions> = {
+  capacity: 8,
+  refillPerSecond: 4,
+  maxWaitMs: 10_000,
+};
 
 const CHALLENGE_SIGNATURES = [
   '<title>Just a moment...</title>',
@@ -127,6 +154,30 @@ function normalizeProxyUrl(proxy?: string): string | null {
   if (!proxy?.trim()) return null;
   const trimmed = proxy.trim();
   return /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
+}
+
+/** Transport/socket level failure (DNS, refused, reset, abort/timeout). */
+function isNetworkFailure(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if (error.name === 'AbortError' || error.name === 'TimeoutError') return true;
+  const code = (error as NodeJS.ErrnoException).code;
+  if (typeof code === 'string' && /^(E[A-Z]+|UND_ERR_[A-Z_]+)$/.test(code)) return true;
+  return /fetch failed|ECONN|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|socket hang up|other side closed/i.test(
+    error.message,
+  );
+}
+
+/**
+ * Maps a thrown outbound error to the counter bucket it belongs to.
+ * `null` means "not an outbound failure" (e.g. a mapping bug) - it is left
+ * uncounted instead of being mislabelled as a network problem.
+ */
+function classifyFailure(error: unknown): RequestFailureClass | null {
+  if (!error) return null;
+  if (error instanceof BotCheckDetectedError) return 'bot-check';
+  if (error instanceof UnauthorizedError) return 'unauthorized';
+  if (error instanceof RequestFailedError) return 'graphql';
+  return isNetworkFailure(error) ? 'network' : null;
 }
 
 function mapUser(u: UserNode | null | undefined): UserProfile {
@@ -276,6 +327,18 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
   private readonly reviewCheckDeals = new Map<string, { lastCheck: number; tries: number }>();
   private readonly contractIssues: ContractIssue[] = [];
 
+  private readonly httpLimiter: TokenBucket;
+  private readonly wsLimiter: TokenBucket;
+  private readonly requestCounts = new Map<string, number>();
+  private readonly failureCounts: Record<RequestFailureClass, number> = {
+    unauthorized: 0,
+    'bot-check': 0,
+    network: 0,
+    graphql: 0,
+  };
+  private latencyTotalMs = 0;
+  private latencyCount = 0;
+
   constructor(options: GraphQLTransportOptions) {
     this.baseUrl = (options.baseUrl ?? 'https://playerok.com').replace(/\/+$/, '');
     this.wsUrl = options.wsUrl ?? 'wss://ws.playerok.com/graphql';
@@ -294,6 +357,16 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
     this.reviewPollIntervalMs = options.reviewPollIntervalMs ?? 30_000;
     this.newDealsPollIntervalMs = options.newDealsPollIntervalMs ?? 15_000;
     this.wsPingIntervalMs = options.wsPingIntervalMs ?? 30_000;
+    this.httpLimiter = new TokenBucket({
+      ...DEFAULT_HTTP_RATE_LIMIT,
+      ...options.httpRateLimit,
+      name: 'playerok-http',
+    });
+    this.wsLimiter = new TokenBucket({
+      ...DEFAULT_WS_RATE_LIMIT,
+      ...options.wsRateLimit,
+      name: 'playerok-ws',
+    });
   }
 
   private baseHeaders(operationName: string): Record<string, string> {
@@ -327,6 +400,54 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  /**
+   * Single choke point for every outbound HTTP call: takes a token from the HTTP
+   * bucket, then records the operation, its latency and (when it throws) the
+   * failure class. A limiter rejection is not counted as a request - no HTTP
+   * call was made.
+   */
+  private async track<T>(operation: string, run: () => Promise<T>): Promise<T> {
+    await this.httpLimiter.acquire();
+    const startedAt = performance.now();
+    try {
+      const result = await run();
+      this.recordRequest(operation, startedAt, null);
+      return result;
+    } catch (error) {
+      this.recordRequest(operation, startedAt, error);
+      throw error;
+    }
+  }
+
+  private recordRequest(operation: string, startedAt: number, error: unknown): void {
+    this.requestCounts.set(operation, (this.requestCounts.get(operation) ?? 0) + 1);
+    this.latencyTotalMs += Math.max(0, performance.now() - startedAt);
+    this.latencyCount += 1;
+    const failure = classifyFailure(error);
+    if (failure) this.failureCounts[failure] += 1;
+  }
+
+  /**
+   * Snapshot of outbound behaviour: requests per operation, failures per class,
+   * total/count/average latency and the live throttle state. Safe to call at any
+   * time; it does not mutate counters and does not consume tokens.
+   */
+  public getRequestStats(): RequestStats {
+    let totalRequests = 0;
+    for (const count of this.requestCounts.values()) totalRequests += count;
+    return {
+      requests: Object.fromEntries(this.requestCounts),
+      failures: { ...this.failureCounts },
+      totalRequests,
+      latency: {
+        totalMs: this.latencyTotalMs,
+        count: this.latencyCount,
+        averageMs: this.latencyCount > 0 ? this.latencyTotalMs / this.latencyCount : 0,
+      },
+      limiters: { http: this.httpLimiter.stats(), ws: this.wsLimiter.stats() },
+    };
   }
 
   private parseGraphqlResponse<T>(resp: Response, bodyText: string, operationName: string): T {
@@ -399,80 +520,86 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
   /**
    * Executes a persisted GET GraphQL query matching PlayerOK's Apollo APQ protocol.
    */
-  private async persistedQuery<T>(
+  private persistedQuery<T>(
     operationName: keyof typeof PERSISTED_QUERIES,
     variables: Record<string, unknown> = {},
   ): Promise<T> {
-    const params = new URLSearchParams({
-      operationName,
-      variables: JSON.stringify(variables),
-      extensions: JSON.stringify({
-        persistedQuery: {
-          version: 1,
-          sha256Hash: PERSISTED_QUERIES[operationName],
-        },
-      }),
+    return this.track(operationName, async () => {
+      const params = new URLSearchParams({
+        operationName,
+        variables: JSON.stringify(variables),
+        extensions: JSON.stringify({
+          persistedQuery: {
+            version: 1,
+            sha256Hash: PERSISTED_QUERIES[operationName],
+          },
+        }),
+      });
+      const url = `${this.baseUrl}/graphql?${params.toString()}`;
+      const resp = await this.fetchRaw(url, {
+        method: 'GET',
+        headers: this.baseHeaders(operationName),
+      });
+      const bodyText = await resp.text();
+      return this.parseGraphqlResponse<T>(resp, bodyText, operationName);
     });
-    const url = `${this.baseUrl}/graphql?${params.toString()}`;
-    const resp = await this.fetchRaw(url, {
-      method: 'GET',
-      headers: this.baseHeaders(operationName),
-    });
-    const bodyText = await resp.text();
-    return this.parseGraphqlResponse<T>(resp, bodyText, operationName);
   }
 
   /**
    * Executes a POST GraphQL query/mutation.
    */
-  private async postQuery<T>(
+  private postQuery<T>(
     operationName: string,
     query: string,
     variables: Record<string, unknown> = {},
   ): Promise<T> {
-    const resp = await this.fetchRaw(`${this.baseUrl}/graphql`, {
-      method: 'POST',
-      headers: {
-        ...this.baseHeaders(operationName),
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({ operationName, query, variables }),
+    return this.track(operationName, async () => {
+      const resp = await this.fetchRaw(`${this.baseUrl}/graphql`, {
+        method: 'POST',
+        headers: {
+          ...this.baseHeaders(operationName),
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ operationName, query, variables }),
+      });
+      const bodyText = await resp.text();
+      return this.parseGraphqlResponse<T>(resp, bodyText, operationName);
     });
-    const bodyText = await resp.text();
-    return this.parseGraphqlResponse<T>(resp, bodyText, operationName);
   }
 
   /**
    * Executes a GraphQL multipart file upload mutation (Apollo Upload spec).
    */
-  private async postMultipart<T>(
+  private postMultipart<T>(
     operationName: string,
     query: string,
     variables: Record<string, unknown>,
     filesMap: Record<string, { path: string[]; file: BinaryUpload }>,
   ): Promise<T> {
-    const form = new FormData();
-    const map: Record<string, string[]> = {};
-    for (const [fieldKey, entry] of Object.entries(filesMap)) {
-      map[fieldKey] = entry.path;
-    }
-    form.append('operations', JSON.stringify({ operationName, query, variables }));
-    form.append('map', JSON.stringify(map));
+    return this.track(operationName, async () => {
+      const form = new FormData();
+      const map: Record<string, string[]> = {};
+      for (const [fieldKey, entry] of Object.entries(filesMap)) {
+        map[fieldKey] = entry.path;
+      }
+      form.append('operations', JSON.stringify({ operationName, query, variables }));
+      form.append('map', JSON.stringify(map));
 
-    for (const [fieldKey, entry] of Object.entries(filesMap)) {
-      const blob = new Blob([new Uint8Array(entry.file.data)], {
-        type: entry.file.contentType || 'application/octet-stream',
+      for (const [fieldKey, entry] of Object.entries(filesMap)) {
+        const blob = new Blob([new Uint8Array(entry.file.data)], {
+          type: entry.file.contentType || 'application/octet-stream',
+        });
+        form.append(fieldKey, blob, entry.file.filename);
+      }
+
+      const resp = await this.fetchRaw(`${this.baseUrl}/graphql`, {
+        method: 'POST',
+        headers: this.baseHeaders(operationName),
+        body: form,
       });
-      form.append(fieldKey, blob, entry.file.filename);
-    }
-
-    const resp = await this.fetchRaw(`${this.baseUrl}/graphql`, {
-      method: 'POST',
-      headers: this.baseHeaders(operationName),
-      body: form,
+      const bodyText = await resp.text();
+      return this.parseGraphqlResponse<T>(resp, bodyText, operationName);
     });
-    const bodyText = await resp.text();
-    return this.parseGraphqlResponse<T>(resp, bodyText, operationName);
   }
 
   public async getAccount(): Promise<AccountInfo> {
@@ -613,15 +740,17 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
     });
   }
 
-  public async downloadFile(url: string): Promise<Buffer> {
-    const resp = await this.fetchRaw(url, {
-      method: 'GET',
-      headers: { 'user-agent': this.userAgent },
+  public downloadFile(url: string): Promise<Buffer> {
+    return this.track('downloadFile', async () => {
+      const resp = await this.fetchRaw(url, {
+        method: 'GET',
+        headers: { 'user-agent': this.userAgent },
+      });
+      if (!resp.ok) {
+        throw new RequestFailedError(resp.status, `Не удалось скачать файл ${url}: HTTP ${resp.status}`);
+      }
+      return Buffer.from(await resp.arrayBuffer());
     });
-    if (!resp.ok) {
-      throw new RequestFailedError(resp.status, `Не удалось скачать файл ${url}: HTTP ${resp.status}`);
-    }
-    return Buffer.from(await resp.arrayBuffer());
   }
 
   private async uploadChatImage(chatId: string, file: BinaryUpload): Promise<string> {
@@ -1087,15 +1216,40 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
     return [{ type: EventTypes.NEW_MESSAGE, chat, message, timestamp: now }];
   }
 
-  private subscribeChatMessages(chatId: string): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+  /**
+   * Sends one WS frame through the WS bucket. Returns `false` when the socket is
+   * no longer open (nothing was sent); throws only when the limiter itself
+   * rejects (closed transport / max wait), which callers roll back on.
+   */
+  private async sendWs(
+    ws: WebSocket,
+    payload: Record<string, unknown>,
+    operation: string,
+  ): Promise<boolean> {
+    await this.wsLimiter.acquire();
+    if (ws.readyState !== WebSocket.OPEN) return false;
+    const startedAt = performance.now();
+    try {
+      ws.send(JSON.stringify(payload));
+      this.recordRequest(operation, startedAt, null);
+      return true;
+    } catch (error) {
+      this.recordRequest(operation, startedAt, error);
+      return false;
+    }
+  }
+
+  private async subscribeChatMessages(chatId: string): Promise<void> {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
     if (this.subscribedChatIds.has(chatId)) return;
     const subId = `msg-${chatId}-${crypto.randomUUID().slice(0, 6)}`;
     this.subscribedChatIds.add(chatId);
     this.chatSubIds.set(subId, chatId);
     try {
-      this.ws.send(
-        JSON.stringify({
+      const sent = await this.sendWs(
+        ws,
+        {
           id: subId,
           type: 'subscribe',
           payload: {
@@ -1103,14 +1257,17 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
             query: GQL_QUERIES.chatMessageCreated,
             variables: { filter: { chatId } },
           },
-        }),
+        },
+        'ws:subscribe',
       );
+      if (sent) return;
     } catch {
-      // Roll back so the chat is not considered subscribed on a dead socket
-      // (otherwise it is never re-subscribed until the next reconnect).
-      this.subscribedChatIds.delete(chatId);
-      this.chatSubIds.delete(subId);
+      // Limiter closed or timed out: fall through and roll back.
     }
+    // Roll back so the chat is not considered subscribed on a dead socket
+    // (otherwise it is never re-subscribed until the next reconnect).
+    this.subscribedChatIds.delete(chatId);
+    this.chatSubIds.delete(subId);
   }
 
   /**
@@ -1171,7 +1328,7 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
         const isKnown = this.knownChats.has(chat.id);
         this.knownChats.set(chat.id, chat);
         if (!isKnown) {
-          this.subscribeChatMessages(chat.id);
+          void this.subscribeChatMessages(chat.id).catch(() => {});
         }
         const last = chat.lastMessage;
         if (!last) continue;
@@ -1228,6 +1385,10 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
 
   public async subscribe(handler: PlayerokEventHandler): Promise<() => void> {
     this.closed = false;
+    // A transport that was closed and is subscribed again must accept traffic
+    // again; without this every acquire would reject with RateLimitClosedError.
+    this.httpLimiter.reopen();
+    this.wsLimiter.reopen();
 
     // Seed initial chats & emit CHAT_INITIALIZED
     try {
@@ -1268,11 +1429,13 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
       this.ws = ws;
 
       ws.on('open', () => {
-        ws.send(JSON.stringify({ type: 'connection_init', payload: {} }));
+        void this.sendWs(ws, { type: 'connection_init', payload: {} }, 'ws:connection_init').catch(
+          () => {},
+        );
         if (this.pingTimer) clearInterval(this.pingTimer);
         this.pingTimer = setInterval(() => {
           if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'ping' }));
+            void this.sendWs(ws, { type: 'ping' }, 'ws:ping').catch(() => {});
           }
         }, this.wsPingIntervalMs);
         this.pingTimer.unref?.();
@@ -1285,7 +1448,7 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
         try {
           const msg = JSON.parse(raw.toString()) as { id?: string; type: string; payload?: any };
           if (msg.type === 'ping') {
-            ws.send(JSON.stringify({ type: 'pong' }));
+            await this.sendWs(ws, { type: 'pong' }, 'ws:pong');
             return;
           }
           if (msg.type === 'pong') return;
@@ -1305,8 +1468,9 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
             this.wsReconnectAttempts = 0;
 
             if (this.accountId) {
-              ws.send(
-                JSON.stringify({
+              await this.sendWs(
+                ws,
+                {
                   id: 'user-updated',
                   type: 'subscribe',
                   payload: {
@@ -1314,11 +1478,13 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
                     query: GQL_QUERIES.userUpdated,
                     variables: { userId: this.accountId },
                   },
-                }),
+                },
+                'ws:subscribe',
               );
             }
-            ws.send(
-              JSON.stringify({
+            await this.sendWs(
+              ws,
+              {
                 id: 'chat-updated',
                 type: 'subscribe',
                 payload: {
@@ -1326,10 +1492,11 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
                   query: GQL_QUERIES.chatUpdated,
                   variables: { filter: this.accountId ? { userId: this.accountId } : undefined },
                 },
-              }),
+              },
+              'ws:subscribe',
             );
             for (const chatId of this.knownChats.keys()) {
-              this.subscribeChatMessages(chatId);
+              await this.subscribeChatMessages(chatId);
             }
 
             if (this.wsLostAt !== null) {
@@ -1356,7 +1523,7 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
               const existed = this.knownChats.has(chat.id);
               this.knownChats.set(chat.id, chat);
               if (!existed) {
-                this.subscribeChatMessages(chat.id);
+                void this.subscribeChatMessages(chat.id).catch(() => {});
                 await handler({ type: EventTypes.CHAT_INITIALIZED, chat, timestamp: Date.now() });
               }
               if (chat.lastMessage && this.claimMessageId(chat.lastMessage.id)) {
@@ -1420,6 +1587,11 @@ export class GraphQLPlayerokTransport implements PlayerokTransport {
 
   public async close(): Promise<void> {
     this.closed = true;
+    // Drain the throttle queues first: nobody may keep waiting for a slot the
+    // closed transport will never use. Pending acquire() calls reject instead
+    // of hanging, and no pump timer survives the close.
+    this.httpLimiter.close();
+    this.wsLimiter.close();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;

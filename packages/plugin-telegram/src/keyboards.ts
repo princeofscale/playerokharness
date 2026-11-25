@@ -25,6 +25,7 @@ import {
   type LoadedPluginRecord,
   type MessagesSettings,
   type MessageTemplate,
+  type PluginIntegrityResult,
   type Review,
   type SbpBankMember,
   type SetupProblem,
@@ -35,6 +36,16 @@ import { computeOrdersStats, type StatsPeriod, type TrackedPosition } from '@pkh
 import type { RetryTask } from '@pkh/plugin-retry-queue';
 import { fitCallback } from './callbacks.js';
 import type { BindingBucket, BindingStoreKey } from './fsm.js';
+import {
+  AUDIT_PAGE_SIZE,
+  auditTimestampText,
+  formatBytes,
+  formatDuration,
+  integrityHashPrefix,
+  type AuditEntryView,
+  type AuditOutcomeKind,
+  type RuntimeHealthSnapshot,
+} from './system.js';
 
 export interface RenderedView {
   text: string;
@@ -138,7 +149,7 @@ export function renderMainMenu(dryRun = false, setupProblem: SetupProblem | null
     .text('🔌 Плагины', 'menu:modules').text('🗒️ Логи', 'menu:logs').row()
     .text('🔁 Очередь повторов', 'menu:retry_queue').text('🔃 Обновления', 'menu:updates').row()
     .text('🔑 Авторизации', 'menu:signed_users').text('🗂 Конфиги', 'menu:configs').row()
-    .text('🌐 Открыть дашборд', 'web:open');
+    .text('⚙️ Система', 'sys:menu').text('🌐 Открыть дашборд', 'web:open');
   return { text, keyboard: kb };
 }
 
@@ -944,4 +955,207 @@ export function renderRetryQueue(tasks: RetryTask[]): RenderedView {
 
   kb.text('⬅️ В меню', 'menu:main');
   return { text: lines.join('\n'), keyboard: kb };
+}
+
+// ---------------------------------------------------------------------------
+// System panel: audit trail, plugin integrity, runtime health
+// ---------------------------------------------------------------------------
+
+/** Icon for every audit outcome, including the bucket a foreign service may report. */
+const AUDIT_OUTCOME_ICON: Record<AuditOutcomeKind, string> = {
+  ok: '✅',
+  failed: '❌',
+  skipped: '⏭️',
+  unknown: '•',
+};
+
+/** A mismatch is the one state that has to jump out of the screen. */
+const INTEGRITY_ICON: Record<PluginIntegrityResult['state'], string> = {
+  ok: '🟢',
+  mismatch: '🚨',
+  missing: '⚠️',
+  unknown: '❔',
+};
+
+/** Broken plugins are listed first, so a loud state is never below the fold. */
+const INTEGRITY_RANK: Record<PluginIntegrityResult['state'], number> = {
+  mismatch: 0,
+  missing: 1,
+  unknown: 2,
+  ok: 3,
+};
+
+/** Entry point of the operator area: three read-only screens, no shell required. */
+export function renderSystemMenu(): RenderedView {
+  const text = [
+    '<b>⚙️ Система</b>',
+    '',
+    'Экран оператора: журнал действий бота, контроль файлов плагинов и состояние процесса.',
+    'Всё открывается из Telegram — shell и веб-панель не нужны.',
+  ].join('\n');
+
+  const kb = new InlineKeyboard()
+    .text('🗒️ Журнал аудита', 'sys:audit:0')
+    .text('🔐 Целостность плагинов', 'sys:integrity').row()
+    .text('📈 Состояние среды', 'sys:health').row()
+    .text('⬅️ В меню', 'menu:main');
+  return { text, keyboard: kb };
+}
+
+/** Explanation rendered in place of a screen whose subsystem is absent or broken. */
+export function renderSystemNotice(title: string, reason: string): RenderedView {
+  return {
+    text: ['<b>⚠️ ' + escapeHtml(title) + '</b>', '', escapeHtml(reason)].join('\n'),
+    keyboard: new InlineKeyboard()
+      .text('⚙️ Система', 'sys:menu')
+      .text('🏠 В меню', 'menu:main'),
+  };
+}
+
+/**
+ * Newest-first page of the audit trail. `total` comes from the service counters when it
+ * reports them, otherwise from the fetched window (null means "ещё есть записи").
+ */
+export function renderAuditLog(
+  entries: AuditEntryView[],
+  page = 0,
+  hasMore = false,
+  total: number | null = null,
+): RenderedView {
+  const totalPages =
+    total !== null && total >= 0
+      ? Math.max(1, Math.ceil(total / AUDIT_PAGE_SIZE))
+      : page + (hasMore ? 2 : 1);
+  const safePage = Math.max(0, Math.min(page, totalPages - 1));
+
+  const lines = entries.length
+    ? entries.map((entry) => {
+        const actor = entry.actor ? ' · ' + escapeHtml(entry.actor) : '';
+        const title = entry.title ? ' — ' + escapeHtml(entry.title) : '';
+        const time = escapeHtml(auditTimestampText(entry.at));
+        return (
+          AUDIT_OUTCOME_ICON[entry.outcome] +
+          ' <code>' + time + '</code> <b>' + escapeHtml(entry.action) + '</b>' + actor + title
+        );
+      })
+    : ['<i>Записей пока нет.</i>'];
+
+  const text = [
+    '<b>🗒️ Журнал аудита</b>',
+    ...(total !== null ? ['Всего записей: <b>' + total + '</b>'] : []),
+    // The trail is written in UTC and never rewritten, so the screen says so instead
+    // of silently showing a time the operator would read as local.
+    ...(entries.length ? ['<i>Время указано в UTC.</i>'] : []),
+    '',
+    ...lines,
+    ...(totalPages > 1 ? ['', '<i>Страница ' + (safePage + 1) + ' из ' + totalPages + '</i>'] : []),
+  ].join('\n');
+
+  const kb = new InlineKeyboard();
+  appendPager(kb, safePage, totalPages, 'sys:audit');
+  kb.text('🧹 Очистить журнал', 'sys:audit_clear').row()
+    .text('🔄 Обновить', 'sys:audit:' + safePage)
+    .text('⚙️ Система', 'sys:menu').row();
+  return { text, keyboard: kb };
+}
+
+/**
+ * Confirmation step of the clear action. The log is an audit trail, so the destructive
+ * button is never the one the operator lands on by pressing «Обновить».
+ */
+export function renderAuditClearConfirm(total: number | null = null): RenderedView {
+  const text = [
+    '<b>🧹 Очистка журнала аудита</b>',
+    '',
+    total !== null ? 'Будет удалено записей: <b>' + total + '</b>.' : 'Будут удалены все записи журнала.',
+    '⚠️ Действие необратимо: история действий бота исчезнет.',
+  ].join('\n');
+
+  const kb = new InlineKeyboard()
+    .text('✅ Да, очистить', 'sys:audit_clear_yes')
+    .text('⬅️ Отмена', 'sys:audit:0');
+  return { text, keyboard: kb };
+}
+
+/** One plugin row: state icon, id, and the short hash prefix of the checked file. */
+function integrityRow(result: PluginIntegrityResult): string {
+  const icon = INTEGRITY_ICON[result.state] ?? '❔';
+  const id = '<b>' + escapeHtml(result.id) + '</b>';
+  const expected = '<code>' + escapeHtml(integrityHashPrefix(result.expected)) + '</code>';
+  const actual = '<code>' + escapeHtml(integrityHashPrefix(result.actual)) + '</code>';
+  if (result.state === 'ok') return icon + ' ' + id + ' — ok · ' + actual;
+  // A mismatch is rendered in bold with both hashes: the operator must see what changed.
+  if (result.state === 'mismatch') return icon + ' ' + id + ' — <b>MISMATCH</b> · ' + expected + ' ≠ ' + actual;
+  if (result.state === 'missing') return icon + ' ' + id + ' — <b>файл не найден</b> · эталон ' + expected;
+  return icon + ' ' + id + ' — <b>нет эталона</b> · сейчас ' + actual;
+}
+
+/** Plugin integrity screen: ok / mismatch / missing / unknown, mismatches first. */
+export function renderPluginIntegrity(results: PluginIntegrityResult[]): RenderedView {
+  const counts: Record<PluginIntegrityResult['state'], number> = {
+    ok: 0,
+    mismatch: 0,
+    missing: 0,
+    unknown: 0,
+  };
+  for (const result of results) {
+    const state = result.state;
+    if (state in counts) counts[state] += 1;
+  }
+  const ordered = [...results].sort(
+    (left, right) => (INTEGRITY_RANK[left.state] ?? 9) - (INTEGRITY_RANK[right.state] ?? 9),
+  );
+
+  const lines: string[] = [];
+  if (counts.mismatch > 0) {
+    lines.push(
+      '🚨 <b>ОБНАРУЖЕНО НЕСОВПАДЕНИЕ ХЕША: ' + counts.mismatch + '</b>',
+      '<blockquote>Файл плагина изменён после установки. Проверьте его и перезапустите бота до запуска торговли.</blockquote>',
+      '',
+    );
+  }
+  lines.push(
+    'Проверено: <b>' + results.length + '</b> · ok <b>' + counts.ok + '</b> · mismatch <b>' + counts.mismatch +
+      '</b> · missing <b>' + counts.missing + '</b> · unknown <b>' + counts.unknown + '</b>',
+    '',
+  );
+  if (ordered.length === 0) {
+    lines.push('<i>Внешних плагинов нет — проверять нечего.</i>');
+  }
+  for (const result of ordered) lines.push(integrityRow(result));
+
+  return {
+    text: ['<b>🔐 Целостность плагинов</b>', '', ...lines].join('\n'),
+    keyboard: new InlineKeyboard()
+      .text('🔄 Проверить снова', 'sys:integrity')
+      .text('⚙️ Система', 'sys:menu'),
+  };
+}
+
+/** Runtime health: uptime, memory, node version, plugin count and queue depth. */
+export function renderRuntimeHealth(snapshot: RuntimeHealthSnapshot): RenderedView {
+  const queue = snapshot.retryQueue;
+  const text = [
+    '<b>📈 Состояние среды</b>',
+    '',
+    'Аптайм: <b>' + formatDuration(snapshot.uptimeSec) + '</b>',
+    'Node.js: <code>' + escapeHtml(snapshot.nodeVersion) + '</code> · ' + escapeHtml(snapshot.platform) + ' · PID ' + snapshot.pid,
+    'Память: RSS <b>' + formatBytes(snapshot.rssBytes) + '</b> · heap <b>' + formatBytes(snapshot.heapUsedBytes) +
+      '</b> из <b>' + formatBytes(snapshot.heapTotalBytes) + '</b>',
+    'Плагины: <b>' + snapshot.pluginsEnabled + '/' + snapshot.pluginsTotal + '</b> активно',
+    '',
+    '<b>🔁 Очередь повторов</b>',
+    queue
+      ? 'pending <b>' + queue.pending + '</b>' +
+        (queue.processing > 0 ? ' (в работе <b>' + queue.processing + '</b>)' : '') +
+        ' · Dead-Letter <b>' + queue.dead + '</b>'
+      : '<i>Сервис очереди повторов не подключён.</i>',
+  ].join('\n');
+
+  return {
+    text,
+    keyboard: new InlineKeyboard()
+      .text('🔄 Обновить', 'sys:health')
+      .text('⚙️ Система', 'sys:menu'),
+  };
 }

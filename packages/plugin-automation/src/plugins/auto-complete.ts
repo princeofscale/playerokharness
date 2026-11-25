@@ -1,6 +1,7 @@
 import { ItemDealStatuses, itemMatchesAnyBinding, type Context } from '@pkh/core';
 import '@pkh/adapter';
 import '@pkh/plugin-retry-queue';
+import { auditOnce } from '../audit.js';
 
 export const autoCompletePlugin = {
   name: 'automation:auto-complete',
@@ -45,9 +46,29 @@ export const autoCompletePlugin = {
           try {
             await ctx.playerok.updateDeal(event.deal.id, ItemDealStatuses.SENT);
             ctx.storage.markDealCompleted(event.deal.id);
+            auditOnce(ctx, {
+              action: 'auto-complete.sent',
+              title: `Сделка ${event.deal.id} подтверждена автоматически`,
+              details: {
+                dealId: event.deal.id,
+                itemId: event.deal.item.id,
+                amount: event.deal.item.price,
+              },
+            });
             log.info(`Сделка ${event.deal.id} подтверждена автоматически`);
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
+            auditOnce(ctx, {
+              action: 'auto-complete.failed',
+              outcome: 'failed',
+              title: `Ошибка авто-подтверждения сделки ${event.deal.id}`,
+              details: {
+                dealId: event.deal.id,
+                itemId: event.deal.item.id,
+                amount: event.deal.item.price,
+                error: msg,
+              },
+            });
             log.error(`Ошибка авто-подтверждения сделки ${event.deal.id}: ${msg}`);
             const retryQueue = ctx.get('retryQueue', false);
             if (retryQueue) {

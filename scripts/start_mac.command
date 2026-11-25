@@ -9,7 +9,9 @@ if [ ! -d "node_modules" ]; then
   pnpm install
 fi
 
-if [ ! -f "packages/app/dist/cli.js" ]; then
+# Incremental build on every start: a stale dist/ used to run silently after a
+# source change. Set PKH_SKIP_BUILD=1 to skip it.
+if [ "${PKH_SKIP_BUILD:-0}" != "1" ]; then
   echo "Собираю PlayerOK Harness (pkh)..."
   pnpm build
 fi

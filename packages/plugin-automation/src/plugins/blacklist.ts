@@ -6,6 +6,7 @@ import {
 } from '@pkh/core';
 import '@pkh/adapter';
 import '@pkh/plugin-retry-queue';
+import { auditOnce } from '../audit.js';
 
 export function buildTemplateVars(ctx: Context, event: Pick<DealEvent, 'deal' | 'chat'>): Record<string, unknown> {
   const buyer = event.deal.user ?? ctx.playerok.getChatOtherUser(event.chat);
@@ -32,14 +33,45 @@ export const blacklistPlugin = {
         const entry = ctx.blacklist.getEntry(username);
         if (!entry) return;
 
+        auditOnce(ctx, {
+          action: 'blacklist.block',
+          title: `Сделка ${event.deal.id}: покупатель в чёрном списке`,
+          details: {
+            dealId: event.deal.id,
+            itemId: event.deal.item.id,
+            amount: event.deal.item.price,
+            buyer: entry.username,
+          },
+        });
+
         let refunded = false;
         const cfg = ctx.storage.getConfig();
         if (cfg.playerok.blacklist.auto_refund) {
           try {
             await ctx.playerok.updateDeal(event.deal.id, ItemDealStatuses.ROLLED_BACK);
             refunded = true;
+            auditOnce(ctx, {
+              action: 'blacklist.refund',
+              title: `Сделка ${event.deal.id} возвращена: покупатель в чёрном списке`,
+              details: {
+                dealId: event.deal.id,
+                itemId: event.deal.item.id,
+                amount: event.deal.item.price,
+              },
+            });
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
+            auditOnce(ctx, {
+              action: 'blacklist.refund',
+              outcome: 'failed',
+              title: `Не удалось вернуть сделку ${event.deal.id} покупателя из ЧС`,
+              details: {
+                dealId: event.deal.id,
+                itemId: event.deal.item.id,
+                amount: event.deal.item.price,
+                error: msg,
+              },
+            });
             log.error(`Не удалось вернуть сделку ${event.deal.id} покупателя из ЧС: ${msg}`);
             const retryQueue = ctx.get('retryQueue', false);
             if (retryQueue) {

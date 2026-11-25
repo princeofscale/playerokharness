@@ -36,6 +36,8 @@ import {
   type PendingInput,
 } from './fsm.js';
 import {
+  renderAuditClearConfirm,
+  renderAuditLog,
   renderBindingsList,
   renderBlacklist,
   renderBumpPositions,
@@ -62,13 +64,17 @@ import {
   renderModulesList,
   renderNotificationsSettings,
   renderOtherSettings,
+  renderPluginIntegrity,
   renderProfile,
   renderRestoreSettings,
   renderRetryQueue,
   renderReviewsList,
+  renderRuntimeHealth,
   renderSetupMode,
   renderSignedUsers,
   renderStats,
+  renderSystemMenu,
+  renderSystemNotice,
   renderTransactionsList,
   renderUpdatesMenu,
   renderWithdrawalCards,
@@ -77,9 +83,28 @@ import {
   toGrammyKeyboard,
   type RenderedView,
 } from './keyboards.js';
+import {
+  auditPageLimit,
+  auditTotalOf,
+  buildAuditPage,
+  describeError,
+  readPluginIntegrity,
+  retryQueueHealth,
+  type AuditLogLike,
+  type RetryQueueLike,
+  type RuntimeHealthSnapshot,
+} from './system.js';
 
 /** Ограничение на размер файла, скачиваемого из Telegram (защита от роста памяти). */
 const MAX_TELEGRAM_FILE_BYTES = 25 * 1024 * 1024;
+
+/**
+ * Shown instead of the audit screen when no audit service is mounted. The trail is an
+ * optional integration: the rest of the panel (integrity, health, every other screen)
+ * must keep working without it.
+ */
+const AUDIT_MISSING_TEXT =
+  'Сервис аудита не подключён, поэтому история действий бота недоступна. Подключите модуль аудита — остальные экраны раздела «Система» работают без него.';
 
 /**
  * Every callback `section` the router understands. `noop` is short-circuited by the
@@ -119,6 +144,7 @@ export const CALLBACK_SECTIONS = [
   'action',
   'fsm',
   'web',
+  'sys',
 ] as const;
 
 export function isKnownCallbackSection(data: string): boolean {
@@ -844,6 +870,215 @@ export class TelegramService extends Service {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // System panel: audit trail, plugin integrity, runtime health
+  // -------------------------------------------------------------------------
+
+  /**
+   * Structural read of the optional audit service. The trail is provided by a plugin this
+   * package must not depend on, so the screen reads it by name and accepts any object that
+   * can list records; a missing, disabled or broken service is a normal deployment.
+   */
+  private auditService(): AuditLogLike | null {
+    try {
+      const audit = this.ctx.get('audit', false) as AuditLogLike | undefined;
+      return audit && typeof audit === 'object' ? audit : null;
+    } catch (err) {
+      this.log.warn(`Сервис аудита недоступен: ${describeError(err)}`);
+      return null;
+    }
+  }
+
+  /** Calls one optional audit member; undefined when the service does not implement it. */
+  private async callAudit(
+    audit: AuditLogLike,
+    method: 'list' | 'query' | 'stats' | 'clear',
+    options?: unknown,
+  ): Promise<unknown> {
+    const fn = audit[method];
+    if (typeof fn !== 'function') return undefined;
+    return await Promise.resolve(options === undefined ? fn.call(audit) : fn.call(audit, options));
+  }
+
+  /** One page of the audit trail, explaining a missing service instead of failing. */
+  private async auditView(page: number): Promise<RenderedView> {
+    const audit = this.auditService();
+    if (!audit) return renderSystemNotice('Журнал аудита', AUDIT_MISSING_TEXT);
+
+    const lister =
+      typeof audit.list === 'function' ? 'list' : typeof audit.query === 'function' ? 'query' : null;
+    if (!lister) {
+      return renderSystemNotice(
+        'Журнал аудита',
+        'Сервис аудита не предоставляет список записей: нет ни list(), ни query().',
+      );
+    }
+
+    let payload: unknown;
+    try {
+      payload = await this.callAudit(audit, lister, { limit: auditPageLimit(page) });
+    } catch (err) {
+      // A service that takes no options object is still readable: retry without one.
+      this.log.warn(
+        `Журнал аудита: list() не принял опции (${describeError(err)}), повторяю без них`,
+      );
+      payload = await this.callAudit(audit, lister);
+    }
+
+    let total: number | null = null;
+    try {
+      total = auditTotalOf(await this.callAudit(audit, 'stats'));
+    } catch (err) {
+      // Counters are decoration: a broken stats() must never hide the entries.
+      this.log.warn(`Статистика аудита недоступна: ${describeError(err)}`);
+    }
+
+    const pageData = buildAuditPage(payload, page);
+    return renderAuditLog(pageData.entries, pageData.page, pageData.hasMore, total ?? pageData.total);
+  }
+
+  /** Confirmation step of the clear action: it never clears on its own. */
+  private async auditClearConfirm(): Promise<RenderedView> {
+    const audit = this.auditService();
+    if (!audit) return renderSystemNotice('Журнал аудита', AUDIT_MISSING_TEXT);
+    let total: number | null = null;
+    try {
+      total = auditTotalOf(await this.callAudit(audit, 'stats'));
+    } catch (err) {
+      this.log.warn(`Статистика аудита недоступна: ${describeError(err)}`);
+    }
+    return renderAuditClearConfirm(total);
+  }
+
+  /** Second press of the clear action: wipes the trail, answers, re-renders the screen. */
+  private async clearAuditLog(gctx: GrammyContext): Promise<void> {
+    const audit = this.auditService();
+    if (!audit || typeof audit.clear !== 'function') {
+      // The alert text is capped at 200 characters by the Bot API, so it stays short;
+      // the explanation lives on the re-rendered screen below.
+      const reason = audit ? 'Сервис аудита не поддерживает очистку' : 'Сервис аудита не подключён';
+      await gctx.answerCallbackQuery({ text: reason, show_alert: true }).catch(() => {});
+      return this.renderSystemScreen(gctx, 'Журнал аудита', () => this.auditView(0));
+    }
+
+    try {
+      await this.callAudit(audit, 'clear');
+      this.log.info('Журнал аудита очищен из Telegram-панели');
+      // The trail is already gone: a rejected ack must not abort the re-render below.
+      await gctx.answerCallbackQuery({ text: 'Журнал аудита очищен' }).catch(() => {});
+    } catch (err) {
+      const message = describeError(err);
+      this.log.warn(`Очистка журнала аудита не удалась: ${message}`);
+      await gctx
+        .answerCallbackQuery({
+          text: `Не удалось очистить журнал: ${message.slice(0, 100)}`,
+          show_alert: true,
+        })
+        .catch(() => {});
+    }
+    return this.renderSystemScreen(gctx, 'Журнал аудита', () => this.auditView(0));
+  }
+
+  /** Plugin integrity screen; an older manager without the check gets an explanation. */
+  private integrityView(): RenderedView {
+    const results = readPluginIntegrity(this.ctx.plugins);
+    if (results === null) {
+      return renderSystemNotice(
+        'Целостность плагинов',
+        'Менеджер плагинов не поддерживает проверку целостности: метод verifyPluginIntegrity() отсутствует. Обновите @pkh/core или проверьте плагины командой pkh doctor.',
+      );
+    }
+    return renderPluginIntegrity(results);
+  }
+
+  /** Process counters plus whatever the optional retry queue reports. */
+  private async runtimeHealth(): Promise<RuntimeHealthSnapshot> {
+    const memory = process.memoryUsage();
+    const plugins = this.ctx.plugins.list();
+
+    let queue: RuntimeHealthSnapshot['retryQueue'] = null;
+    try {
+      const service = this.ctx.get('retryQueue', false) as RetryQueueLike | undefined;
+      const stats =
+        service && typeof service.getStats === 'function'
+          ? await Promise.resolve(service.getStats(true))
+          : undefined;
+      queue = retryQueueHealth(stats);
+    } catch (err) {
+      this.log.warn(`Очередь повторов недоступна: ${describeError(err)}`);
+    }
+
+    return {
+      uptimeSec: process.uptime(),
+      rssBytes: memory.rss,
+      heapUsedBytes: memory.heapUsed,
+      heapTotalBytes: memory.heapTotal,
+      nodeVersion: process.version,
+      platform: `${process.platform}/${process.arch}`,
+      pid: process.pid,
+      pluginsEnabled: plugins.filter((plugin) => plugin.enabled).length,
+      pluginsTotal: plugins.length,
+      retryQueue: queue,
+    };
+  }
+
+  /** Renders one System screen; a broken backend degrades to an explanation, never an alert. */
+  private async renderSystemScreen(
+    gctx: GrammyContext,
+    label: string,
+    build: () => RenderedView | Promise<RenderedView>,
+  ): Promise<void> {
+    try {
+      await this.showView(gctx, await build());
+    } catch (err) {
+      const message = describeError(err);
+      this.log.warn(`Экран «${label}» недоступен: ${message}`);
+      await this.showView(gctx, renderSystemNotice(label, `Экран временно недоступен: ${message}`)).catch(
+        () => {},
+      );
+    }
+  }
+
+  /**
+   * Router of the 'sys' section. Each screen acks and renders by itself: they are read-only,
+   * so a failing subsystem explains itself instead of surfacing as a generic alert.
+   */
+  private async handleSystemCallback(
+    gctx: GrammyContext,
+    action: string | undefined,
+    arg: string | undefined,
+  ): Promise<void> {
+    switch (action) {
+      case 'menu':
+        await gctx.answerCallbackQuery().catch(() => {});
+        return this.renderSystemScreen(gctx, 'Система', () => renderSystemMenu());
+      case 'audit': {
+        const page = Number(arg);
+        await gctx.answerCallbackQuery().catch(() => {});
+        return this.renderSystemScreen(gctx, 'Журнал аудита', () =>
+          this.auditView(Number.isFinite(page) && page > 0 ? Math.trunc(page) : 0),
+        );
+      }
+      case 'audit_clear':
+        await gctx.answerCallbackQuery().catch(() => {});
+        return this.renderSystemScreen(gctx, 'Очистка журнала', () => this.auditClearConfirm());
+      case 'audit_clear_yes':
+        return this.clearAuditLog(gctx);
+      case 'integrity':
+        await gctx.answerCallbackQuery().catch(() => {});
+        return this.renderSystemScreen(gctx, 'Целостность плагинов', () => this.integrityView());
+      case 'health':
+        await gctx.answerCallbackQuery().catch(() => {});
+        return this.renderSystemScreen(gctx, 'Состояние среды', async () =>
+          renderRuntimeHealth(await this.runtimeHealth()),
+        );
+      default:
+        this.log.warn(`Неизвестный экран «Система»: ${action ?? '—'}`);
+        await gctx.answerCallbackQuery({ text: STALE_CALLBACK_TEXT, show_alert: true }).catch(() => {});
+        return;
+    }
+  }
+
   /**
    * Resolves one dynamic callback segment. Keyboards emit a readable literal while the value
    * fits the byte budget and only fall back to a stored token for long values, so this accepts
@@ -986,6 +1221,10 @@ export class TelegramService extends Service {
         );
       }
       return;
+    }
+
+    if (section === 'sys') {
+      return this.handleSystemCallback(gctx, arg1, arg2);
     }
 
     if (section === 'rq') {

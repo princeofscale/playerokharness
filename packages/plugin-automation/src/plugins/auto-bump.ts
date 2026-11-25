@@ -15,6 +15,7 @@ import {
 import '@pkh/adapter';
 import '@pkh/plugin-retry-queue';
 import { announceSafely, notifySafely } from '../notify.js';
+import { auditOnce } from '../audit.js';
 
 export interface TrackedPosition {
   name: string;
@@ -119,6 +120,16 @@ export class AutoBumpService extends Service {
         `«${item.name}» поднят${reason ? ` (${reason})` : ''}. Позиция: ${item.sequence ?? '?'} -> 1`,
       );
 
+      auditOnce(this.ctx, {
+        action: 'bump.ok',
+        title: `Товар «${item.name}» поднят`,
+        details: {
+          itemId: item.id,
+          previousPosition: item.sequence ?? undefined,
+          reason,
+        },
+      });
+
       await announceSafely(this.ctx, 'item/bumped', {
         itemId: item.id,
         slug: item.slug,
@@ -130,6 +141,12 @@ export class AutoBumpService extends Service {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.log.error(`Ошибка поднятия товара «${itemOrProfile.name}»: ${msg}`);
+      auditOnce(this.ctx, {
+        action: 'bump.failed',
+        outcome: 'failed',
+        title: `Ошибка поднятия товара «${itemOrProfile.name}»`,
+        details: { itemId: itemOrProfile.id, error: msg },
+      });
       await notifySafely(this.ctx, {
         eventKey: 'item_bumped',
         title: `❌ Ошибка при поднятии товара «${itemOrProfile.name}»`,

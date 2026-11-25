@@ -7,6 +7,7 @@ import {
 } from '@pkh/core';
 import '@pkh/adapter';
 import { announceSafely, notifySafely } from '../notify.js';
+import { auditOnce } from '../audit.js';
 
 export interface AutoWithdrawalConfig {
   tickIntervalMs?: number;
@@ -88,6 +89,12 @@ export class AutoWithdrawalService extends Service {
       });
 
       this.log.info(`Создана заявка на вывод ${balance}₽ (ID: ${tx.id}, провайдер: ${provider})`);
+      auditOnce(this.ctx, {
+        action: 'withdrawal.requested',
+        title: `Создана заявка на вывод ${balance}₽`,
+        details: { transactionId: tx.id, amount: balance, provider },
+      });
+
       await announceSafely(this.ctx, 'withdrawal/requested', {
         transactionId: tx.id,
         amount: balance,
@@ -97,6 +104,13 @@ export class AutoWithdrawalService extends Service {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.log.error(`Ошибка авто-вывода (${balance}₽): ${message}`);
+      auditOnce(this.ctx, {
+        action: 'withdrawal.failed',
+        outcome: 'failed',
+        title: `Ошибка авто-вывода (${balance}₽)`,
+        // Never the destination: a card number / phone / wallet is a credential.
+        details: { amount: balance, error: message },
+      });
       await notifySafely(this.ctx, {
         eventKey: 'withdrawal_requested',
         title: `❌ Ошибка при создании транзакции на вывод ${balance}₽`,

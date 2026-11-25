@@ -1,5 +1,6 @@
 export * from './errors.js';
 export * from './queries.js';
+export * from './rate-limit.js';
 export * from './schemas.js';
 export * from './transport.js';
 export * from './mock-transport.js';

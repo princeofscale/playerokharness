@@ -249,6 +249,10 @@ function makeTransport(srv: ContractServer): GraphQLPlayerokTransport {
     wsUrl: srv.wsUrl,
     cookies: 'token=secret; __ddg5_=abc',
     timeoutMs: 5_000,
+    // Contract tests fire dozens of calls in a burst; throttling is covered separately
+    // in rate-limit.test.ts and must not stretch this suite to seconds.
+    httpRateLimit: { capacity: 0 },
+    wsRateLimit: { capacity: 0 },
   });
 }
 

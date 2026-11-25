@@ -357,3 +357,81 @@ export interface PluginIntegrityResult {
   size?: number;
   installedAt?: string;
 }
+
+// ---------------------------------------------------------------------------
+// Audit trail (bot_data/audit.jsonl, one JSON object per line)
+// ---------------------------------------------------------------------------
+
+/** Who caused the automated money/inventory action. */
+export type AuditActor = 'auto' | 'telegram' | 'system';
+
+/** Did the action happen, fail, or was it deliberately not attempted. */
+export type AuditOutcome = 'ok' | 'failed' | 'skipped';
+
+/**
+ * One line of bot_data/audit.jsonl. Append-only: a record is never rewritten,
+ * so the file stays a linear history of what the bot did with money and stock.
+ */
+export interface AuditEntry {
+  /** ISO timestamp (UTC) of the action. */
+  at: string;
+  /** Dotted action name, e.g. `delivery.sent` or `withdrawal.requested`. */
+  action: string;
+  actor: AuditActor;
+  outcome: AuditOutcome;
+  /** One-line human summary. Never a token, cookie or delivered goods value. */
+  title: string;
+  /** Small structured context (ids, amounts, counts) — no credentials. */
+  details?: Record<string, unknown>;
+}
+
+/**
+ * Input of AuditService.record(). `at` defaults to now, `actor` to 'auto',
+ * `outcome` to 'ok'; a caller that knows none of them only has to name the action.
+ */
+export interface AuditRecordInput {
+  action: string;
+  title: string;
+  actor?: AuditActor;
+  outcome?: AuditOutcome;
+  details?: Record<string, unknown>;
+  at?: string;
+}
+
+/**
+ * Query of AuditService.list(). `since` is inclusive and accepts an ISO
+ * timestamp or epoch milliseconds; results are newest-first.
+ */
+export interface AuditListOptions {
+  limit?: number;
+  since?: string | number;
+  action?: string;
+}
+
+export interface AuditStats {
+  entries: number;
+  /** Alias of `entries`, kept for dashboards that look for `total`. */
+  total: number;
+  bytes: number;
+  /** Newest-first counters, so a dashboard can show what the trail is made of. */
+  byAction: Array<{ key: string; count: number }>;
+  byOutcome: Array<{ key: string; count: number }>;
+  oldestAt?: string;
+  newestAt?: string;
+}
+
+/** Retention bounds of prune(); every field falls back to the service default. */
+export interface AuditPruneOptions {
+  maxEntries?: number;
+  maxBytes?: number;
+  maxAgeDays?: number;
+}
+
+export interface AuditPruneResult {
+  /** Lines dropped from the file (old, malformed, over the entry cap or the byte cap). */
+  removed: number;
+  /** Lines left in the file, newest kept. */
+  kept: number;
+  /** Size of the rewritten file in bytes. */
+  bytes: number;
+}

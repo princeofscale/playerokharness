@@ -12,6 +12,7 @@ import {
   type AnalyticsTotals,
   type AnalyticsView,
 } from './analytics.js';
+import type { AuditEntryView, AuditStatsView, AuditView } from './audit.js';
 
 export interface AccountView {
   id: string;
@@ -70,8 +71,39 @@ const NAV = [
   { href: '/analytics', label: 'Аналитика', key: 'analytics' },
   { href: '/deals', label: 'Сделки', key: 'deals' },
   { href: '/queue', label: 'Очередь', key: 'queue' },
+  { href: '/audit', label: 'Аудит', key: 'audit' },
   { href: '/logs', label: 'Логи', key: 'logs' },
+  { href: '/metrics', label: 'Метрики', key: 'metrics' },
 ] as const;
+
+/**
+ * Every page also carries the list of dashboard endpoints at the bottom, so an
+ * operator never has to remember a route or go back to the overview for it.
+ * Paths are compiled-in constants, not request data, so they need no escaping.
+ */
+const API_ENDPOINTS = [
+  { path: '/api/status', note: 'сводка' },
+  { path: '/analytics', note: 'аналитика выручки' },
+  { path: '/api/analytics', note: 'аналитика выручки в JSON' },
+  { path: '/deals', note: 'кэш сделок' },
+  { path: '/api/deals', note: 'кэш сделок в JSON' },
+  { path: '/api/queue', note: 'очередь повторов' },
+  { path: '/audit', note: 'журнал аудита' },
+  { path: '/api/audit', note: 'журнал аудита в JSON' },
+  { path: '/metrics', note: 'метрики Prometheus' },
+  { path: '/events', note: 'поток Server-Sent Events' },
+] as const;
+
+function renderApiList(): string {
+  const items = API_ENDPOINTS.map(
+    (endpoint) => `  <li><code>${endpoint.path}</code> — ${escapeHtml(endpoint.note)}</li>`,
+  ).join('\n');
+
+  return `<section class="card"><h2>JSON API</h2>
+<ul>
+${items}
+</ul></section>`;
+}
 
 const STYLE = `
   :root { color-scheme: dark; }
@@ -157,6 +189,7 @@ function layout(title: string, active: string, content: string): string {
 </header>
 <main>
 ${content}
+${renderApiList()}
 </main>
 <footer>Режим только для чтения · страница обновляется автоматически</footer>
 </body>
@@ -195,17 +228,11 @@ export function renderOverview(view: OverviewView): string {
   return layout(
     'Обзор',
     'overview',
+    // The endpoint list is appended by layout(), so it stays on every page
+    // including this one, and the overview does not repeat it.
     `<p class="muted">${meta}</p>
 ${cards}
-<section class="card"><h2>Ошибки при запуске</h2>${errors}</section>
-<section class="card"><h2>JSON API</h2><ul>
-  <li><code>/api/status</code> — сводка</li>
-  <li><code>/analytics</code> — аналитика выручки</li>
-  <li><code>/api/analytics</code> — аналитика выручки в JSON</li>
-  <li><code>/api/deals</code> — кэш сделок</li>
-  <li><code>/api/queue</code> — очередь повторов</li>
-  <li><code>/events</code> — поток Server-Sent Events</li>
-</ul></section>`,
+<section class="card"><h2>Ошибки при запуске</h2>${errors}</section>`,
   );
 }
 
@@ -367,6 +394,91 @@ export function renderQueue(data: { stats: QueueStatsView | null; tasks: QueueTa
     `<section class="card">
   <h2>Очередь повторов</h2>
   <p class="muted">pending: ${data.stats.pending} · dead: ${data.stats.dead} · всего: ${data.stats.total}</p>
+  ${body}
+</section>`,
+  );
+}
+
+function renderAuditRow(entry: AuditEntryView): string {
+  return `<tr>
+  <td>${escapeHtml(entry.at.length > 0 ? entry.at : '—')}</td>
+  <td><code>${escapeHtml(entry.action)}</code></td>
+  <td>${escapeHtml(entry.outcome)}</td>
+  <td>${escapeHtml(entry.title.length > 0 ? entry.title : '—')}</td>
+</tr>`;
+}
+
+/** Counters are decoration: absent or broken statistics render as nothing. */
+function renderAuditStats(stats: AuditStatsView | null): string {
+  if (!stats) return '';
+
+  const parts: string[] = [];
+  if (stats.total !== null) parts.push(`всего записей: ${stats.total}`);
+  if (stats.byAction.length > 0) {
+    parts.push(
+      `по действиям: ${stats.byAction
+        .slice(0, 12)
+        .map((bucket) => `${escapeHtml(bucket.key)}=${bucket.count}`)
+        .join(', ')}`,
+    );
+  }
+  if (stats.byOutcome.length > 0) {
+    parts.push(
+      `по исходам: ${stats.byOutcome
+        .slice(0, 12)
+        .map((bucket) => `${escapeHtml(bucket.key)}=${bucket.count}`)
+        .join(', ')}`,
+    );
+  }
+
+  return parts.length === 0 ? '' : `<p class="muted">${parts.join(' · ')}</p>`;
+}
+
+/**
+ * Audit trail page. The service is optional, so the page has three states and
+ * none of them can throw: not mounted (explanation), mounted but unreadable
+ * (explanation plus the error), and readable (newest-first table).
+ */
+export function renderAudit(view: AuditView): string {
+  if (!view.available) {
+    return layout(
+      'Аудит',
+      'audit',
+      `<section class="card">
+  <h2>Журнал аудита</h2>
+  <p class="muted">Служба аудита не подключена</p>
+  <p class="muted">Страница работает и без неё: записи появятся здесь, как только в приложении смонтирована служба <code>audit</code>.</p>
+</section>`,
+    );
+  }
+
+  const filter = view.action === null ? '' : ` · фильтр: ${escapeHtml(view.action)}`;
+  const error =
+    view.error === null
+      ? ''
+      : `<p class="muted">Не удалось прочитать журнал: ${escapeHtml(view.error)}</p>`;
+  const actions =
+    view.actions.length === 0
+      ? ''
+      : `<p class="muted">Действия: ${view.actions.slice(0, 12).map((action) => escapeHtml(action)).join(', ')}</p>`;
+
+  const body =
+    view.entries.length === 0
+      ? '<p class="muted">Записей нет</p>'
+      : `<table>
+  <thead><tr><th>Время</th><th>Действие</th><th>Исход</th><th>Событие</th></tr></thead>
+  <tbody>${view.entries.map(renderAuditRow).join('')}</tbody>
+</table>`;
+
+  return layout(
+    'Аудит',
+    'audit',
+    `<section class="card">
+  <h2>Журнал аудита</h2>
+  <p class="muted">Показано ${view.entries.length} из ${view.total}${filter}</p>
+  ${error}
+  ${actions}
+  ${renderAuditStats(view.stats)}
   ${body}
 </section>`,
   );

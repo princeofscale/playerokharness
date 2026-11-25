@@ -1,6 +1,7 @@
 import path from 'node:path';
 import {
   AccessService,
+  AuditService,
   BlacklistService,
   BootReportService,
   Context,
@@ -62,6 +63,9 @@ export async function createApplication(options: AppOptions = {}): Promise<Playe
   await ctx.use(LockService);
   await ctx.use(AccessService);
   await ctx.use(BlacklistService);
+  // Mounted before the automation bundle: otherwise the first deals of a session would
+  // be delivered without an audit record (automation reads it through ctx.get).
+  await ctx.use(AuditService);
   await ctx.use(BootReportService);
   await ctx.use(UpdaterService, {
     currentVersion: VERSION,

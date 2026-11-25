@@ -12,6 +12,7 @@ import {
 import '@pkh/adapter';
 import '@pkh/plugin-retry-queue';
 import type { RetryTask } from '@pkh/plugin-retry-queue';
+import { auditOnce, auditPass } from '../audit.js';
 
 /** Storage key of the rule list; the critical section is scoped to this store only. */
 export const AUTO_DELIVERY_STORE = 'auto_deliveries';
@@ -174,6 +175,11 @@ export class AutoDeliveryService extends Service {
 
     if (settled) {
       this.ctx.storage.markDealDelivered(dealId);
+      auditOnce(this.ctx, {
+        action: 'delivery.settled',
+        title: `Повторная выдача по сделке ${dealId} доставлена — резерв снят`,
+        details: { dealId },
+      });
       this.log.info(`Повторная выдача по сделке ${dealId} доставлена — резерв снят`);
     }
   }
@@ -181,6 +187,11 @@ export class AutoDeliveryService extends Service {
   private async deliverDeal(event: DealEvent): Promise<void> {
     const rules = this.ctx.storage.getAutoDeliveries();
     const retryQueue = this.ctx.get('retryQueue', false);
+    // One recorder per pass: a deal matched by two rules logs each fact once.
+    const audit = auditPass(this.ctx);
+    const dealId = event.deal.id;
+    const itemId = event.deal.item.id;
+    const amount = event.deal.item.price;
     let anyDelivered = false;
 
     for (let i = 0; i < rules.length; i++) {
@@ -194,20 +205,44 @@ export class AutoDeliveryService extends Service {
 
         if (outcome.kind === 'empty') {
           this.log.warn(`Авто-выдача по товару «${event.deal.item.name}»: закончились поштучные товары!`);
+          audit.record({
+            action: 'delivery.failed',
+            outcome: 'failed',
+            title: `Авто-выдача: закончились поштучные товары для «${event.deal.item.name}»`,
+            details: { dealId, itemId, amount, reason: 'empty_stock' },
+          });
           continue;
         }
         if (outcome.kind === 'already') {
           this.log.debug(
             `Сделка ${event.deal.id}: товар для правила «${event.deal.item.name}» уже зарезервирован — пропуск`,
           );
+          audit.record({
+            action: 'delivery.skipped',
+            outcome: 'skipped',
+            title: `Сделка ${dealId}: товар уже зарезервирован за ней`,
+            details: { dealId, itemId, amount, reason: 'already_reserved' },
+          });
           continue;
         }
         if (outcome.kind === 'missing') {
           this.log.warn(
             `Сделка ${event.deal.id}: правило авто-выдачи изменилось до выдачи товара «${event.deal.item.name}» — пропуск`,
           );
+          audit.record({
+            action: 'delivery.skipped',
+            outcome: 'skipped',
+            title: `Сделка ${dealId}: правило авто-выдачи изменилось до выдачи товара`,
+            details: { dealId, itemId, amount, reason: 'rule_missing' },
+          });
           continue;
         }
+
+        audit.record({
+          action: 'delivery.reserved',
+          title: `Товар зарезервирован для сделки ${dealId}`,
+          details: { dealId, itemId, amount },
+        });
 
         const good = outcome.good;
         // --- no lock: the network call of one deal must not block any other deal ---
@@ -226,10 +261,26 @@ export class AutoDeliveryService extends Service {
             this.log.warn(
               `Товар «${good}» выдан, но резерв не найден в правиле авто-выдачи — проверьте остатки вручную`,
             );
+            audit.record({
+              action: 'delivery.sent',
+              title: `Авто-выдача по сделке ${dealId} отправлена`,
+              details: { dealId, itemId, amount },
+            });
+            audit.record({
+              action: 'delivery.settled',
+              outcome: 'failed',
+              title: `Сделка ${dealId}: товар выдан, но резерв не найден`,
+              details: { dealId, itemId, amount, reason: 'reservation_missing' },
+            });
           } else {
             this.log.info(
               `Покупателю ${event.deal.user.username} выдан товар «${good}». Остаток: ${remaining}`,
             );
+            audit.record({
+              action: 'delivery.sent',
+              title: `Авто-выдача по сделке ${dealId} отправлена`,
+              details: { dealId, itemId, amount, remaining },
+            });
           }
         } else if (retryQueue) {
           // The key stays reserved: the retry task owns it, and it must not be sold to
@@ -245,6 +296,11 @@ export class AutoDeliveryService extends Service {
             this.log.warn(
               `Товар «${good}» не отправлен (${sendError ?? 'sendMessage вернул null'}) — поставлен в очередь повторов и остаётся зарезервированным`,
             );
+            audit.record({
+              action: 'delivery.queued',
+              title: `Отправка по сделке ${dealId} поставлена в очередь повторов`,
+              details: { dealId, itemId, amount, error: sendError ?? 'sendMessage вернул null' },
+            });
           } catch (enqueueErr) {
             // Neither sent nor retryable: return the key to the pool, otherwise it is
             // neither sent nor sellable (silent inventory loss).
@@ -252,12 +308,30 @@ export class AutoDeliveryService extends Service {
             this.log.error(
               `Не удалось поставить выдачу в очередь повторов: ${enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr)} — товар возвращён в остатки`,
             );
+            audit.record({
+              action: 'delivery.failed',
+              outcome: 'failed',
+              title: `Сделка ${dealId}: выдача не отправлена и не поставлена в очередь`,
+              details: {
+                dealId,
+                itemId,
+                amount,
+                reason: 'queue_failed',
+                error: enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr),
+              },
+            });
           }
         } else {
           await this.runExclusive(() => this.releasePiece(i, key, good, event.deal.id));
           this.log.error(
             `Товар «${good}» не отправлен (${sendError ?? 'sendMessage вернул null'}), очередь повторов недоступна — товар возвращён в остатки`,
           );
+          audit.record({
+            action: 'delivery.failed',
+            outcome: 'failed',
+            title: `Сделка ${dealId}: товар не отправлен, очередь повторов недоступна`,
+            details: { dealId, itemId, amount, reason: 'send_failed' },
+          });
         }
       } else {
         const lines = rule.message ?? [];
@@ -274,6 +348,11 @@ export class AutoDeliveryService extends Service {
         if (sent) {
           anyDelivered = true;
           this.log.info(`Покупателю ${event.deal.user.username} отправлено сообщение авто-выдачи`);
+          audit.record({
+            action: 'delivery.sent',
+            title: `Авто-выдача по сделке ${dealId} отправлена`,
+            details: { dealId, itemId, amount },
+          });
         } else if (retryQueue) {
           try {
             await retryQueue.enqueue({
@@ -283,11 +362,35 @@ export class AutoDeliveryService extends Service {
               error: sendError ?? 'sendMessage failed during auto-delivery',
             });
             anyDelivered = true;
+            audit.record({
+              action: 'delivery.queued',
+              title: `Отправка по сделке ${dealId} поставлена в очередь повторов`,
+              details: { dealId, itemId, amount, error: sendError ?? 'sendMessage вернул null' },
+            });
           } catch (enqueueErr) {
             this.log.error(
               `Не удалось поставить сообщение авто-выдачи в очередь повторов: ${enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr)}`,
             );
+            audit.record({
+              action: 'delivery.failed',
+              outcome: 'failed',
+              title: `Сделка ${dealId}: сообщение не отправлено и не поставлено в очередь`,
+              details: {
+                dealId,
+                itemId,
+                amount,
+                reason: 'queue_failed',
+                error: enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr),
+              },
+            });
           }
+        } else {
+          audit.record({
+            action: 'delivery.failed',
+            outcome: 'failed',
+            title: `Сделка ${dealId}: сообщение авто-выдачи не отправлено`,
+            details: { dealId, itemId, amount, reason: 'send_failed' },
+          });
         }
       }
     }

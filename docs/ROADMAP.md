@@ -200,3 +200,30 @@ plugin manifest/signature, and net-profit tracking (revenue is gross today).
 
 Still open: SQLite persistence, `@grammyjs/runner`, telemetry/metrics, i18n of panel
 strings, and a stock screen that separates available vs in-flight inventory (next round).
+
+## 8. Round 5 (2026-11-25) — observability and safety rails
+
+- **Audit trail** (@pkh/core AuditService): append-only JSONL at bot_data/audit.jsonl with
+  fsync per record, torn-line recovery, rotation to a single archive, tail-only reads,
+  secret redaction, retention (prune) and counters by action/outcome. Automation records
+  every money/inventory decision: delivery reserved/sent/queued/failed/settled, completion,
+  bump, restore, withdrawal, blacklist block and refund. The delivered goods value and the
+  withdrawal destination are never written.
+- **Prometheus /metrics** on the dashboard (token-gated like every other route): uptime,
+  RSS/heap, event-loop lag, retry-queue depth per status, cached deals and revenue, enabled
+  plugins, SSE clients, live access tokens. Hand-written exposition writer, no dependency,
+  valid 0.0.4 text with no NaN.
+- **Outbound rate limiting** in the adapter: a FIFO token bucket for every HTTP call and every
+  WS frame (separate budgets), typed timeout/closed errors, request counters by operation and
+  failure class, latency totals, and a close() that drains waiters instead of hanging.
+- **System screens in Telegram**: audit log with pagination and a confirmed wipe, plugin
+  integrity (ok / mismatch / unknown / missing, mismatches first and loud), runtime health
+  (uptime, RSS, heap, node version, queue depth). Every screen degrades to an explanation
+  when its optional service is absent.
+- **End-to-end journey test**: sale -> single key delivered -> stock consumed -> analytics ->
+  audit entry -> /api/status, /api/deals, /api/audit, /metrics over HTTP.
+- **Launchers** rebuild incrementally on every start (PKH_SKIP_BUILD=1 to skip), so a stale
+  dist/ can no longer run silently.
+
+Still open: SQLite persistence, @grammyjs/runner, per-operation rate weights, daily prune of
+the audit trail, and i18n of the panel strings.

@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import http, { type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo, Socket } from 'node:net';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
 import type { Logger } from 'cordis';
 import {
   type AccountInfo,
@@ -12,6 +13,20 @@ import {
 import type { PlayerokService } from '@pkh/adapter';
 import { type AnalyticsView, computeAnalytics } from './analytics.js';
 import {
+  type AuditSourceLike,
+  type AuditView,
+  emptyAuditView,
+  normalizeAuditAction,
+  normalizeAuditLimit,
+  readAudit,
+} from './audit.js';
+import {
+  type MetricsView,
+  PROMETHEUS_CONTENT_TYPE,
+  type RetryQueueMetricsView,
+  renderPrometheusMetrics,
+} from './metrics.js';
+import {
   type AccountView,
   type BootErrorView,
   type DealView,
@@ -19,6 +34,7 @@ import {
   type QueueStatsView,
   type QueueTaskView,
   renderAnalytics,
+  renderAudit,
   renderDeals,
   renderLogs,
   renderNotFound,
@@ -70,6 +86,8 @@ export const MAX_ACCESS_TOKENS = 50;
 export const MAX_EVENT_BUFFER = 200;
 /** SSE comment written every fifteen seconds so proxies keep the stream open. */
 export const SSE_HEARTBEAT_MS = 15_000;
+/** Resolution of the event-loop-lag histogram exposed on /metrics (Node's default). */
+export const EVENT_LOOP_LAG_RESOLUTION_MS = 20;
 
 /**
  * Thrown when the dashboard would be reachable from outside the machine without
@@ -94,7 +112,8 @@ interface QueueTaskLike {
 }
 
 interface RetryQueueLike {
-  getStats(): QueueStatsView;
+  /** `processing` is optional: only a queue that leases tasks reports the leased count. */
+  getStats(): QueueStatsView & { processing?: number };
   list(status?: 'pending' | 'dead'): QueueTaskLike[];
 }
 
@@ -109,6 +128,11 @@ function isLoopbackHost(host: string): boolean {
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** Counters are never negative and never NaN: anything else degrades to 0. */
+function nonNegative(value: number): number {
+  return Number.isFinite(value) && value > 0 ? value : 0;
 }
 
 /** Constant-time comparison so a wrong token cannot be guessed byte by byte. */
@@ -263,6 +287,12 @@ export class WebDashboardService extends Service {
    * restart invalidates every outstanding link, which is what "short-lived" must mean.
    */
   private readonly accessTokens = new Map<string, number>();
+  /**
+   * Event-loop delay histogram sampled for `pkh_nodejs_eventloop_lag_seconds`.
+   * Null while the service is disabled or when Node refused the sampler; the
+   * metric then reports 0 rather than NaN.
+   */
+  private lagHistogram: ReturnType<typeof monitorEventLoopDelay> | null = null;
 
   constructor(ctx: Context, config: WebDashboardConfig = {}) {
     super(ctx, 'webDashboard');
@@ -300,6 +330,7 @@ export class WebDashboardService extends Service {
 
     ctx.effect(() => this.startHttpServer(), 'webDashboard:http');
     ctx.effect(() => this.subscribeEvents(), 'webDashboard:events');
+    ctx.effect(() => this.startEventLoopLagSampler(), 'webDashboard:lag');
   }
 
   /** Actual bound address (port is resolved even when the config asked for port 0). */
@@ -663,6 +694,31 @@ export class WebDashboardService extends Service {
         this.sendHtml(res, 200, renderLogs(this.readLogLines()));
         return;
       }
+      // Prometheus exposition. It is deliberately NOT an unauthenticated scrape
+      // endpoint: /metrics passes through exactly the same token gate as every
+      // other route (the check lives in handleRequest() and runs before route()
+      // is called), because the numbers expose seller revenue, order volume and
+      // plugin state. There is no bypass here — an anonymous scrape gets the same
+      // 401 page as any other request.
+      case '/metrics': {
+        this.send(
+          res,
+          200,
+          PROMETHEUS_CONTENT_TYPE,
+          renderPrometheusMetrics(this.collectMetrics()),
+        );
+        return;
+      }
+      // Audit trail: the HTML page and its JSON twin share one collector, so both
+      // agree on ordering, filtering and the optional-service fallback.
+      case '/audit': {
+        this.sendHtml(res, 200, renderAudit(this.collectAudit(url)));
+        return;
+      }
+      case '/api/audit': {
+        this.sendJson(res, 200, this.collectAudit(url));
+        return;
+      }
       case '/api/status': {
         this.sendJson(res, 200, { ok: true, ...(await this.buildOverview()) });
         return;
@@ -817,6 +873,135 @@ export class WebDashboardService extends Service {
 
     const deals = Object.values(cached).map(toDealView).sort(compareDealsNewestFirst);
     return { total: deals.length, deals: deals.slice(0, MAX_DEAL_ROWS) };
+  }
+
+  /**
+   * Starts the event-loop delay sampler behind
+   * `pkh_nodejs_eventloop_lag_seconds`. The histogram's internal timer does not
+   * keep the process alive, and dispose disables it, so the dashboard still
+   * frees every resource it took.
+   */
+  private startEventLoopLagSampler(): () => void {
+    let histogram: ReturnType<typeof monitorEventLoopDelay> | null = null;
+    try {
+      histogram = monitorEventLoopDelay({ resolution: EVENT_LOOP_LAG_RESOLUTION_MS });
+      histogram.enable();
+    } catch (error) {
+      this.log.warn(
+        `Не удалось включить замер задержки event loop: ${describeError(error)}`,
+      );
+      histogram = null;
+    }
+    this.lagHistogram = histogram;
+
+    return () => {
+      this.lagHistogram = null;
+      try {
+        histogram?.disable();
+      } catch {
+        // already disabled during shutdown
+      }
+    };
+  }
+
+  /** Mean event loop delay in seconds; 0 when the sampler is unavailable. */
+  private eventLoopLagSeconds(): number {
+    const histogram = this.lagHistogram;
+    if (!histogram) return 0;
+    try {
+      const seconds = histogram.mean / 1e9;
+      return Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * One /metrics scrape. Every number is read through an existing collector, so
+   * a failing optional service degrades to 0 or to an omitted family instead of
+   * breaking the scrape.
+   */
+  private collectMetrics(): MetricsView {
+    const memory = process.memoryUsage();
+    return {
+      version: VERSION,
+      uptimeSeconds: Math.max(0, (Date.now() - this.startedAt) / 1000),
+      residentMemoryBytes: memory.rss,
+      heapUsedBytes: memory.heapUsed,
+      eventLoopLagSeconds: this.eventLoopLagSeconds(),
+      retryQueue: this.readQueueMetrics(),
+      cachedOrders: this.countCachedOrders(),
+      dealsRevenueRub: this.sumDealsRevenue(),
+      pluginsEnabled: this.readPluginSummary().enabled,
+      sseClients: this.streams.size,
+      accessTokens: this.accessTokens.size,
+    };
+  }
+
+  /** Sum of `price` over the existing `cached_orders` store, in roubles. */
+  private sumDealsRevenue(): number {
+    try {
+      let total = 0;
+      for (const order of Object.values(this.ctx.storage.getCachedOrders())) {
+        // A non-finite price would poison the whole sum; it counts as zero.
+        if (Number.isFinite(order.price)) total += order.price;
+      }
+      return Math.round(total * 100) / 100;
+    } catch (error) {
+      this.log.warn(`Не удалось посчитать выручку для метрик: ${describeError(error)}`);
+      return 0;
+    }
+  }
+
+  /** Task counts by status, or null when the queue is not mounted. */
+  private readQueueMetrics(): RetryQueueMetricsView | null {
+    const queue = this.retryQueue();
+    if (!queue) return null;
+    try {
+      const stats = queue.getStats();
+      let processing =
+        typeof stats.processing === 'number' && Number.isFinite(stats.processing)
+          ? nonNegative(stats.processing)
+          : null;
+      if (processing === null) {
+        // A queue without leases does not report the field; list() still knows.
+        try {
+          processing = queue.list().filter((task) => task.status === 'processing').length;
+        } catch {
+          processing = 0;
+        }
+      }
+      return {
+        pending: nonNegative(stats.pending),
+        processing,
+        dead: nonNegative(stats.dead),
+      };
+    } catch (error) {
+      this.log.warn(`Не удалось прочитать очередь для метрик: ${describeError(error)}`);
+      return null;
+    }
+  }
+
+  /** Optional audit trail; null when no service is mounted on the context. */
+  private auditSource(): AuditSourceLike | null {
+    return (this.ctx.get('audit', false) as AuditSourceLike | undefined) ?? null;
+  }
+
+  /**
+   * Audit page and /api/audit payload. The service is optional, so this never
+   * throws: a missing one yields an explanation, a broken one keeps the reason.
+   */
+  private collectAudit(url: URL): AuditView {
+    const limit = normalizeAuditLimit(url.searchParams.get('limit'));
+    const action = normalizeAuditAction(url.searchParams.get('action'));
+    const source = this.auditSource();
+    try {
+      return readAudit(source, { limit, action });
+    } catch (error) {
+      const message = describeError(error);
+      this.log.warn(`Не удалось прочитать журнал аудита: ${message}`);
+      return emptyAuditView({ available: source !== null, limit, action, error: message });
+    }
   }
 
   private retryQueue(): RetryQueueLike | null {

@@ -16,6 +16,7 @@ import {
 import '@pkh/adapter';
 import '@pkh/plugin-retry-queue';
 import { announceSafely, notifySafely } from '../notify.js';
+import { auditOnce } from '../audit.js';
 
 export interface AutoRestoreConfig {
   expiredCheckIntervalMs?: number;
@@ -333,6 +334,18 @@ export class AutoRestoreService extends Service {
         `Товар «${item.name}» ${shouldRecreate ? 'пересоздан' : 'восстановлен'} (${premResult ? 'премиум' : 'бесплатный'})`,
       );
 
+      auditOnce(this.ctx, {
+        action: 'restore.ok',
+        title: `Товар «${item.name}» ${shouldRecreate ? 'пересоздан' : 'восстановлен'}`,
+        details: {
+          itemId: newItem.id,
+          oldItemId: shouldRecreate ? item.id : undefined,
+          isPremium: premResult,
+          recreated: shouldRecreate,
+          dataReplacedRemaining,
+        },
+      });
+
       await announceSafely(this.ctx, 'item/restored', {
         itemId: newItem.id,
         oldItemId: shouldRecreate ? item.id : undefined,
@@ -347,6 +360,12 @@ export class AutoRestoreService extends Service {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.log.error(`Ошибка при восстановлении товара «${itemOrProfile.name}»: ${message}`);
+      auditOnce(this.ctx, {
+        action: 'restore.failed',
+        outcome: 'failed',
+        title: `Ошибка при восстановлении товара «${itemOrProfile.name}»`,
+        details: { itemId: itemOrProfile.id, error: message },
+      });
       await notifySafely(this.ctx, {
         eventKey: 'item_restored',
         title: `❌ Ошибка при восстановлении товара «${itemOrProfile.name}»`,
